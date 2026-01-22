@@ -54,9 +54,9 @@ EXAMPLES = $(BUILDDIR)/simple_daemon $(BUILDDIR)/multi_instance $(BUILDDIR)/kern
            $(BUILDDIR)/qd_dhcpd
 TESTS = $(BUILDDIR)/test_memory $(BUILDDIR)/test_threadpool $(BUILDDIR)/test_event $(BUILDDIR)/test_ipc
 
-.PHONY: all clean examples tests install kmod
+.PHONY: all clean examples tests install kmod kmods
 
-all: $(LIB_STATIC) $(LIB_SHARED) $(CLIENT_STATIC) $(CLIENT_SHARED) examples tests
+all: $(LIB_STATIC) $(LIB_SHARED) $(CLIENT_STATIC) $(CLIENT_SHARED) examples tests kmods
 
 examples: $(EXAMPLES)
 
@@ -133,6 +133,11 @@ test: tests
 # Kernel module
 kmod:
 	$(MAKE) -C kernel
+
+# Kernel modules (core + examples)
+kmods: kmod
+	$(MAKE) -C examples/af_meta/kernel
+	$(MAKE) -C examples/dhcp/kernel
 
 # Installation
 PREFIX ?= /usr/local

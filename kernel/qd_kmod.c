@@ -8,10 +8,12 @@
 #include <linux/init.h>
 #include <net/genetlink.h>
 
+#define QD_KMOD_VERSION "1.0"
+
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("QDaemon");
 MODULE_DESCRIPTION("QDaemon Kernel Module");
-MODULE_VERSION("1.0");
+MODULE_VERSION(QD_KMOD_VERSION);
 
 /* Netlink family name - must match userspace */
 #define QD_GENL_NAME "QDAEMON"
@@ -52,6 +54,7 @@ static struct genl_multicast_group qd_genl_mcgrps[] = {
 /* Forward declarations */
 static int qd_cmd_echo(struct sk_buff *skb, struct genl_info *info);
 static int qd_cmd_info(struct sk_buff *skb, struct genl_info *info);
+int qd_send_notify(const char *msg);
 
 /* Operations */
 static const struct genl_ops qd_genl_ops[] = {
@@ -121,7 +124,7 @@ static int qd_cmd_info(struct sk_buff *skb, struct genl_info *info)
     void *hdr;
     char msg[128];
 
-    snprintf(msg, sizeof(msg), "QDaemon Kernel Module v%s", MODULE_VERSION);
+    snprintf(msg, sizeof(msg), "QDaemon Kernel Module v%s", QD_KMOD_VERSION);
 
     reply = genlmsg_new(NLMSG_GOODSIZE, GFP_KERNEL);
     if (!reply)
