@@ -1,18 +1,4 @@
 # QDaemon Makefile
-# Alternative to CMake build
-
-CC ?= gcc
-AR ?= ar
-CFLAGS = -Wall -Wextra -Werror -std=c11 -D_GNU_SOURCE
-CFLAGS += -Iinclude -Isrc/util -Isrc/cint
-LDFLAGS = -lpthread -lrt -lreadline -lm
-
-DEBUG ?= 0
-ifeq ($(DEBUG), 1)
-    CFLAGS += -g -O0 -DDEBUG
-else
-    CFLAGS += -O2 -DNDEBUG
-endif
 
 # Directories
 BUILDDIR = build
@@ -20,6 +6,21 @@ SRCDIR = src
 CLIENTDIR = client
 EXAMPLEDIR = examples
 TESTDIR = tests
+
+
+CC ?= gcc
+AR ?= ar
+CFLAGS = -Wall -Wextra -Werror -std=c11 -D_GNU_SOURCE
+CFLAGS += -Iinclude -Isrc/util -Isrc/cint
+LDFLAGS = -lpthread -lrt -lreadline -lm 
+LDFLAGS += -L$(BUILDDIR) -Wl,-rpath,'$$ORIGIN'
+
+DEBUG ?= 0
+ifeq ($(DEBUG), 1)
+    CFLAGS += -g -O0 -DDEBUG
+else
+    CFLAGS += -O2 -DNDEBUG
+endif
 
 # Sources
 CORE_SRCS = $(wildcard $(SRCDIR)/core/*.c)
@@ -48,7 +49,9 @@ LIB_SHARED = $(BUILDDIR)/libqdaemon.so
 CLIENT_STATIC = $(BUILDDIR)/libqdclient.a
 CLIENT_SHARED = $(BUILDDIR)/libqdclient.so
 
-EXAMPLES = $(BUILDDIR)/simple_daemon $(BUILDDIR)/multi_instance $(BUILDDIR)/kernel_comm $(BUILDDIR)/meta_cli
+EXAMPLES = $(BUILDDIR)/simple_daemon $(BUILDDIR)/multi_instance $(BUILDDIR)/kernel_comm \
+           $(BUILDDIR)/meta_cli $(BUILDDIR)/meta_server $(BUILDDIR)/meta_client \
+           $(BUILDDIR)/qd_dhcpd
 TESTS = $(BUILDDIR)/test_memory $(BUILDDIR)/test_threadpool $(BUILDDIR)/test_event $(BUILDDIR)/test_ipc
 
 .PHONY: all clean examples tests install kmod
@@ -99,6 +102,15 @@ $(BUILDDIR)/kernel_comm: $(EXAMPLEDIR)/kernel_comm.c $(LIB_STATIC)
 
 $(BUILDDIR)/meta_cli: $(EXAMPLEDIR)/af_meta/src/meta_cli.c $(LIB_STATIC)
 	$(CC) $(CFLAGS) -I$(EXAMPLEDIR)/af_meta/include -I$(SRCDIR)/cint $< -o $@ -L$(BUILDDIR) -lqdaemon $(LDFLAGS)
+
+$(BUILDDIR)/meta_server: $(EXAMPLEDIR)/af_meta/src/meta_server.c $(LIB_STATIC)
+	$(CC) $(CFLAGS) -I$(EXAMPLEDIR)/af_meta/include $< -o $@ -L$(BUILDDIR) -lqdaemon $(LDFLAGS)
+
+$(BUILDDIR)/meta_client: $(EXAMPLEDIR)/af_meta/src/meta_client.c $(LIB_STATIC) $(CLIENT_STATIC)
+	$(CC) $(CFLAGS) -I$(EXAMPLEDIR)/af_meta/include -I$(CLIENTDIR)/include $< -o $@ -L$(BUILDDIR) -lqdaemon -lqdclient $(LDFLAGS)
+
+$(BUILDDIR)/qd_dhcpd: $(EXAMPLEDIR)/dhcp/src/qd_dhcpd.c $(LIB_STATIC)
+	$(CC) $(CFLAGS) -I$(EXAMPLEDIR)/dhcp/include $< -o $@ -L$(BUILDDIR) -lqdaemon $(LDFLAGS)
 
 # Tests
 $(BUILDDIR)/test_memory: $(TESTDIR)/test_memory.c $(LIB_STATIC)

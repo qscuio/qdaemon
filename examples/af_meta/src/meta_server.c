@@ -212,8 +212,8 @@ static const qd_handler_entry_t data_handlers[] = {
  * Socket event handlers
  */
 
-static void process_message(int fd, qd_handler_table_t *handlers, 
-                            meta_stats_t *rx_stat, meta_stats_t *tx_stat)
+static void process_message(int fd, qd_handler_table_t *handlers,
+                            uint64_t *rx_stat, uint64_t *tx_stat)
 {
     uint8_t buf[4096];
     struct qdmeta_meta meta;
