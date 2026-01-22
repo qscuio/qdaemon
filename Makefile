@@ -4,7 +4,7 @@
 CC ?= gcc
 AR ?= ar
 CFLAGS = -Wall -Wextra -Werror -std=c11 -D_GNU_SOURCE
-CFLAGS += -Iinclude -Isrc/util
+CFLAGS += -Iinclude -Isrc/util -Isrc/cint
 LDFLAGS = -lpthread -lrt -lreadline -lm
 
 DEBUG ?= 0
@@ -26,6 +26,7 @@ CORE_SRCS = $(wildcard $(SRCDIR)/core/*.c)
 IPC_SRCS = $(wildcard $(SRCDIR)/ipc/*.c)
 DAEMON_SRCS = $(wildcard $(SRCDIR)/daemon/*.c)
 CLI_SRCS = $(wildcard $(SRCDIR)/cli/*.c)
+CINT_SRCS = $(wildcard $(SRCDIR)/cint/*.c)
 CLIENT_SRCS = $(wildcard $(CLIENTDIR)/src/*.c)
 
 # Objects
@@ -33,9 +34,10 @@ CORE_OBJS = $(CORE_SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
 IPC_OBJS = $(IPC_SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
 DAEMON_OBJS = $(DAEMON_SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
 CLI_OBJS = $(CLI_SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
+CINT_OBJS = $(CINT_SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
 CLIENT_OBJS = $(CLIENT_SRCS:$(CLIENTDIR)/%.c=$(BUILDDIR)/client/%.o)
 
-ALL_OBJS = $(CORE_OBJS) $(IPC_OBJS) $(DAEMON_OBJS) $(CLI_OBJS)
+ALL_OBJS = $(CORE_OBJS) $(IPC_OBJS) $(DAEMON_OBJS) $(CLI_OBJS) $(CINT_OBJS)
 
 # Targets
 LIB_STATIC = $(BUILDDIR)/libqdaemon.a
@@ -48,11 +50,11 @@ TESTS = $(BUILDDIR)/test_memory $(BUILDDIR)/test_threadpool $(BUILDDIR)/test_eve
 
 .PHONY: all clean examples tests install kmod
 
-all: $(LIB_STATIC) $(LIB_SHARED) $(CLIENT_STATIC) $(CLIENT_SHARED)
+all: $(LIB_STATIC) $(LIB_SHARED) $(CLIENT_STATIC) $(CLIENT_SHARED) examples tests
 
-examples: all $(EXAMPLES)
+examples: $(EXAMPLES)
 
-tests: all $(TESTS)
+tests: $(TESTS)
 
 # Create directories
 $(BUILDDIR)/core $(BUILDDIR)/ipc $(BUILDDIR)/daemon $(BUILDDIR)/cli $(BUILDDIR)/client/src:
@@ -64,6 +66,10 @@ $(BUILDDIR)/%.o: $(SRCDIR)/%.c | $(BUILDDIR)/core $(BUILDDIR)/ipc $(BUILDDIR)/da
 
 $(BUILDDIR)/client/%.o: $(CLIENTDIR)/%.c | $(BUILDDIR)/client/src
 	$(CC) $(CFLAGS) -I$(CLIENTDIR)/include -fPIC -c $< -o $@
+
+$(BUILDDIR)/cint/%.o: $(SRCDIR)/cint/%.c
+	mkdir -p $(BUILDDIR)/cint
+	$(CC) $(CFLAGS) -fPIC -c $< -o $@
 
 # Libraries
 $(LIB_STATIC): $(ALL_OBJS)

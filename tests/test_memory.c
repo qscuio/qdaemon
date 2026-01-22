@@ -70,39 +70,41 @@ TEST(strdup_basic)
 }
 
 /* Test slab allocator */
+/* Test slab allocator */
 TEST(slab_basic)
 {
-    qd_slab_t *slab = qd_slab_create(64, 16, 0);
-    assert(slab != NULL);
+    qd_slab_cache_t *cache = qd_slab_cache_create("test_cache", 64, 16, 0);
+    assert(cache != NULL);
     
     void *objects[16];
     for (int i = 0; i < 16; i++) {
-        objects[i] = qd_slab_alloc(slab);
+        objects[i] = qd_slab_alloc(cache);
         assert(objects[i] != NULL);
     }
     
     for (int i = 0; i < 16; i++) {
-        qd_slab_free(slab, objects[i]);
+        qd_slab_free(cache, objects[i]);
     }
     
-    qd_slab_destroy(slab);
+    qd_slab_cache_destroy(cache);
 }
 
 /* Test slab reuse */
 TEST(slab_reuse)
 {
-    qd_slab_t *slab = qd_slab_create(32, 8, 0);
-    assert(slab != NULL);
+    qd_slab_cache_t *cache = qd_slab_cache_create("reuse_cache", 32, 8, 0);
+    assert(cache != NULL);
     
-    void *p1 = qd_slab_alloc(slab);
-    qd_slab_free(slab, p1);
-    void *p2 = qd_slab_alloc(slab);
+    void *p1 = qd_slab_alloc(cache);
+    qd_slab_free(cache, p1);
+    void *p2 = qd_slab_alloc(cache);
     
     /* Freed object should be reused */
     assert(p1 == p2);
+    (void)p1; (void)p2;
     
-    qd_slab_free(slab, p2);
-    qd_slab_destroy(slab);
+    qd_slab_free(cache, p2);
+    qd_slab_cache_destroy(cache);
 }
 
 /* Test arena allocator */
@@ -123,6 +125,8 @@ TEST(arena_basic)
     assert((char*)p2 > (char*)p1);
     assert((char*)p3 > (char*)p2);
     
+    (void)p1; (void)p2; (void)p3;
+    
     qd_arena_destroy(arena);
 }
 
@@ -138,6 +142,7 @@ TEST(arena_reset)
     
     /* After reset, should allocate from beginning again */
     assert(p1 == p2);
+    (void)p1; (void)p2;
     
     qd_arena_destroy(arena);
 }

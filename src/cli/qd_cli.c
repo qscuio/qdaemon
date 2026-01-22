@@ -19,6 +19,7 @@
 #include <readline/history.h>
 
 #include <qdaemon/qd_cli.h>
+#include "qd_cint.h"
 
 /*
  * Internal Structures
@@ -38,6 +39,9 @@ struct qd_cli_shell {
     /* CINT Functions */
     qd_cint_func_t *cint_funcs[QD_CLI_MAX_CINT_FUNCS];
     int num_cint_funcs;
+
+    /* CINT Interpreter */
+    qd_cint_t *cint;
     
     /* Global Commands */
     qd_cli_cmd_t *global_cmds[QD_CLI_MAX_CMDS];
@@ -243,8 +247,11 @@ static qd_cli_result_t cmd_cint(qd_cli_ctx_t *ctx)
         }
     }
     
-    ctx->print("CINT Interpreter (Type 'exit' to quit)\n");
-    /* TODO: Enter CINT mode */
+    ctx->print("Starting QD-CINT Interactive Shell (clean-room)\n");
+    ctx->print("Type 'exit' to return to CLI\n");
+    
+    qd_cint_repl(ctx->shell->cint, "cint> ");
+    
     return QD_CLI_OK;
 }
 
@@ -269,6 +276,9 @@ qd_cli_shell_t *qd_cli_create(const qd_cli_config_t *config)
     shell->mode_stack[0] = root;
     shell->mode_depth = 1;
     
+    /* Create CINT interpreter */
+    shell->cint = qd_cint_create();
+
     /* Register built-ins */
     qd_cli_register_global_cmd(shell, "exit", cmd_exit, "Exit current mode");
     qd_cli_register_global_cmd(shell, "quit", cmd_exit, "Exit current mode");
@@ -293,6 +303,9 @@ void qd_cli_destroy(qd_cli_shell_t *shell)
     for (int i = 0; i < shell->num_cint_funcs; i++) {
         free(shell->cint_funcs[i]);
     }
+
+    if (shell->cint)
+        qd_cint_destroy(shell->cint);
     
     for (int i = 0; i < shell->num_global_cmds; i++) {
         free(shell->global_cmds[i]);
@@ -528,6 +541,10 @@ int qd_cint_register(qd_cli_shell_t *shell, const char *name,
     va_end(args);
     
     shell->cint_funcs[shell->num_cint_funcs++] = f;
+    
+    /* Register with interpreter */
+    qd_cint_register_native(shell->cint, name, func_ptr, num_args);
+    
     return 0;
 }
 
@@ -547,40 +564,18 @@ int qd_cint_call(qd_cli_shell_t *shell, const char *funcname,
         return -1;
     }
     
-    /* This is a simple implementation supporting up to 4 integer/string args 
-       For a real production CINT, use libffi */
+    /* Use CINT interpreter */
+    char buf[1024];
+    snprintf(buf, sizeof(buf), "%s(", funcname);
     
-    long long args[4] = {0};
-    
-    for (int i = 0; i < f->num_args && i < 4; i++) {
-        switch (f->arg_types[i]) {
-            case QD_CINT_INT:
-            case QD_CINT_UINT:
-            case QD_CINT_BOOL:
-                args[i] = atoll(argv[i]);
-                break;
-            case QD_CINT_STRING:
-                args[i] = (long long)argv[i];
-                break;
-            default:
-                args[i] = atoll(argv[i]);
-                break;
-        }
+    for (int i = 0; i < argc; i++) {
+        strncat(buf, argv[i], sizeof(buf) - strlen(buf) - 2);
+        if (i < argc - 1)
+            strcat(buf, ", ");
     }
+    strcat(buf, ")");
     
-    /* Call function */
-    long long result = 0;
-    typedef long long (*func_t)(long long, long long, long long, long long);
-    func_t func = (func_t)f->func_ptr;
-    
-    result = func(args[0], args[1], args[2], args[3]);
-    
-    /* Print return value */
-    if (f->ret_type != QD_CINT_VOID) {
-        printf("CINT: %s returned %lld\n", funcname, result);
-    }
-    
-    return 0;
+    return qd_cint_eval(shell->cint, buf);
 }
 
 /*

@@ -519,6 +519,39 @@ int qd_event_defer(qd_event_loop_t *loop, void (*func)(void *arg), void *arg)
     return QD_OK;
 }
 
+/* Wrapper for deferred timeout */
+static void deferred_timeout_cb(qd_timer_t *timer, void *arg)
+{
+    qd_pending_work_t *work = arg;
+    if (work && work->func) {
+        work->func(work->arg);
+    }
+    free(work);
+    qd_timer_destroy(timer);
+}
+
+int qd_event_defer_timeout(qd_event_loop_t *loop, void (*func)(void *arg), void *arg, int timeout_ms)
+{
+    if (!loop || !func || !loop->timer_wheel)
+        return QD_ERR_INVAL;
+
+    qd_pending_work_t *work = malloc(sizeof(qd_pending_work_t));
+    if (!work)
+        return QD_ERR_NOMEM;
+
+    work->func = func;
+    work->arg = arg;
+    work->next = NULL;
+
+    qd_timer_t *timer = qd_timer_add(loop->timer_wheel, timeout_ms, deferred_timeout_cb, work);
+    if (!timer) {
+        free(work);
+        return QD_ERR_NOMEM;
+    }
+
+    return QD_OK;
+}
+
 /* Process pending work */
 static void process_pending_work(qd_event_loop_t *loop)
 {

@@ -38,7 +38,7 @@ static void delayed_work(void *arg)
 /* Test basic creation */
 TEST(create_destroy)
 {
-    qd_threadpool_t *pool = qd_threadpool_create(4, 100);
+    qd_threadpool_t *pool = qd_threadpool_create(4);
     assert(pool != NULL);
     qd_threadpool_destroy(pool);
 }
@@ -48,12 +48,15 @@ TEST(simple_work)
 {
     atomic_store(&counter, 0);
     
-    qd_threadpool_t *pool = qd_threadpool_create(2, 100);
+    qd_threadpool_t *pool = qd_threadpool_create(2);
     assert(pool != NULL);
     
     for (int i = 0; i < 10; i++) {
-        int ret = qd_threadpool_submit(pool, increment_counter, NULL, 0);
-        assert(ret == QD_OK);
+        int ret = qd_threadpool_submit(pool, increment_counter, NULL);
+        if (ret != QD_OK) {
+            fprintf(stderr, "Submit failed\n");
+            exit(1);
+        }
     }
     
     qd_threadpool_shutdown(pool, QD_SHUTDOWN_GRACEFUL);
@@ -68,11 +71,11 @@ TEST(concurrent_work)
 {
     atomic_store(&counter, 0);
     
-    qd_threadpool_t *pool = qd_threadpool_create(4, 1000);
+    qd_threadpool_t *pool = qd_threadpool_create(4);
     assert(pool != NULL);
     
     for (int i = 0; i < 100; i++) {
-        qd_threadpool_submit(pool, increment_counter, NULL, 0);
+        qd_threadpool_submit(pool, increment_counter, NULL);
     }
     
     qd_threadpool_shutdown(pool, QD_SHUTDOWN_GRACEFUL);
@@ -87,11 +90,11 @@ TEST(delayed_work_execution)
 {
     atomic_store(&counter, 0);
     
-    qd_threadpool_t *pool = qd_threadpool_create(2, 100);
+    qd_threadpool_t *pool = qd_threadpool_create(2);
     assert(pool != NULL);
     
     for (int i = 0; i < 5; i++) {
-        qd_threadpool_submit(pool, delayed_work, (void*)(intptr_t)10, 0);
+        qd_threadpool_submit(pool, delayed_work, (void*)(intptr_t)10);
     }
     
     qd_threadpool_shutdown(pool, QD_SHUTDOWN_GRACEFUL);
@@ -104,14 +107,12 @@ TEST(delayed_work_execution)
 /* Test pool stats */
 TEST(pool_stats)
 {
-    qd_threadpool_t *pool = qd_threadpool_create(4, 100);
+    qd_threadpool_t *pool = qd_threadpool_create(4);
     assert(pool != NULL);
     
     qd_threadpool_stats_t stats;
-    int ret = qd_threadpool_get_stats(pool, &stats);
-    assert(ret == QD_OK);
-    assert(stats.num_threads == 4);
-    assert(stats.queue_capacity == 100);
+    qd_threadpool_stats(pool, &stats);
+    assert(stats.num_workers == 4);
     
     qd_threadpool_destroy(pool);
 }
@@ -121,12 +122,12 @@ TEST(immediate_shutdown)
 {
     atomic_store(&counter, 0);
     
-    qd_threadpool_t *pool = qd_threadpool_create(2, 100);
+    qd_threadpool_t *pool = qd_threadpool_create(2);
     assert(pool != NULL);
     
     /* Submit slow work */
     for (int i = 0; i < 20; i++) {
-        qd_threadpool_submit(pool, delayed_work, (void*)(intptr_t)100, 0);
+        qd_threadpool_submit(pool, delayed_work, (void*)(intptr_t)100);
     }
     
     /* Immediate shutdown - may not complete all */
@@ -144,18 +145,18 @@ TEST(priority_work)
 {
     atomic_store(&counter, 0);
     
-    qd_threadpool_t *pool = qd_threadpool_create(1, 100);
+    qd_threadpool_t *pool = qd_threadpool_create(1);
     assert(pool != NULL);
     
     /* Pause to queue up work */
     qd_threadpool_pause(pool);
     
     /* Submit normal priority */
-    qd_threadpool_submit(pool, increment_counter, NULL, 0);
-    qd_threadpool_submit(pool, increment_counter, NULL, 0);
+    qd_threadpool_submit(pool, increment_counter, NULL);
+    qd_threadpool_submit(pool, increment_counter, NULL);
     
     /* Submit high priority */
-    qd_threadpool_submit(pool, increment_counter, NULL, QD_WORK_PRIORITY_HIGH);
+    qd_threadpool_submit_priority(pool, increment_counter, NULL, QD_PRIORITY_HIGH);
     
     qd_threadpool_resume(pool);
     
