@@ -21,21 +21,24 @@ CLIENTDIR = client
 EXAMPLEDIR = examples
 TESTDIR = tests
 
-# Core sources
+# Sources
 CORE_SRCS = $(wildcard $(SRCDIR)/core/*.c)
 IPC_SRCS = $(wildcard $(SRCDIR)/ipc/*.c)
 DAEMON_SRCS = $(wildcard $(SRCDIR)/daemon/*.c)
 CLI_SRCS = $(wildcard $(SRCDIR)/cli/*.c)
-CINT_SRCS = $(wildcard $(SRCDIR)/cint/*.c)
 CLIENT_SRCS = $(wildcard $(CLIENTDIR)/src/*.c)
+
+# CINT Sources
+CINT_SRCS = $(wildcard $(SRCDIR)/cint/*.c)
 
 # Objects
 CORE_OBJS = $(CORE_SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
 IPC_OBJS = $(IPC_SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
 DAEMON_OBJS = $(DAEMON_SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
 CLI_OBJS = $(CLI_SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
-CINT_OBJS = $(CINT_SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
 CLIENT_OBJS = $(CLIENT_SRCS:$(CLIENTDIR)/%.c=$(BUILDDIR)/client/%.o)
+
+CINT_OBJS = $(CINT_SRCS:$(SRCDIR)/cint/%.c=$(BUILDDIR)/cint/%.o)
 
 ALL_OBJS = $(CORE_OBJS) $(IPC_OBJS) $(DAEMON_OBJS) $(CLI_OBJS) $(CINT_OBJS)
 
@@ -57,7 +60,7 @@ examples: $(EXAMPLES)
 tests: $(TESTS)
 
 # Create directories
-$(BUILDDIR)/core $(BUILDDIR)/ipc $(BUILDDIR)/daemon $(BUILDDIR)/cli $(BUILDDIR)/client/src:
+$(BUILDDIR)/core $(BUILDDIR)/ipc $(BUILDDIR)/daemon $(BUILDDIR)/cli $(BUILDDIR)/cint $(BUILDDIR)/client/src:
 	mkdir -p $@
 
 # Object compilation
@@ -67,8 +70,8 @@ $(BUILDDIR)/%.o: $(SRCDIR)/%.c | $(BUILDDIR)/core $(BUILDDIR)/ipc $(BUILDDIR)/da
 $(BUILDDIR)/client/%.o: $(CLIENTDIR)/%.c | $(BUILDDIR)/client/src
 	$(CC) $(CFLAGS) -I$(CLIENTDIR)/include -fPIC -c $< -o $@
 
-$(BUILDDIR)/cint/%.o: $(SRCDIR)/cint/%.c
-	mkdir -p $(BUILDDIR)/cint
+# CINT Compilation
+$(BUILDDIR)/cint/%.o: $(SRCDIR)/cint/%.c | $(BUILDDIR)/cint
 	$(CC) $(CFLAGS) -fPIC -c $< -o $@
 
 # Libraries
@@ -95,7 +98,7 @@ $(BUILDDIR)/kernel_comm: $(EXAMPLEDIR)/kernel_comm.c $(LIB_STATIC)
 	$(CC) $(CFLAGS) $< -o $@ -L$(BUILDDIR) -lqdaemon $(LDFLAGS)
 
 $(BUILDDIR)/meta_cli: $(EXAMPLEDIR)/af_meta/src/meta_cli.c $(LIB_STATIC)
-	$(CC) $(CFLAGS) -I$(EXAMPLEDIR)/af_meta/include $< -o $@ -L$(BUILDDIR) -lqdaemon $(LDFLAGS)
+	$(CC) $(CFLAGS) -I$(EXAMPLEDIR)/af_meta/include -I$(SRCDIR)/cint $< -o $@ -L$(BUILDDIR) -lqdaemon $(LDFLAGS)
 
 # Tests
 $(BUILDDIR)/test_memory: $(TESTDIR)/test_memory.c $(LIB_STATIC)

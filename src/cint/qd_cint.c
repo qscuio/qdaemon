@@ -5,11 +5,22 @@
 
 #include "qd_cint.h"
 #include "qd_cint_parser.h"
+#include "qd_cint_eval.h"
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <readline/readline.h>
 #include <readline/history.h>
+
+/*
+ * Internal interpreter structure
+ */
+struct qd_cint {
+    qd_cint_eval_t *eval;
+    char *prompt;
+    int verbose;
+    int interactive;
+};
 
 /*
  * Create interpreter

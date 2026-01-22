@@ -6,21 +6,14 @@
 #ifndef QD_CINT_H
 #define QD_CINT_H
 
-#include "qd_cint_eval.h"
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 /*
- * QD-CINT Context
+ * QD-CINT Context (Opaque)
  */
-typedef struct qd_cint {
-    qd_cint_eval_t *eval;
-    char *prompt;
-    int interactive;
-    int verbose;
-} qd_cint_t;
+typedef struct qd_cint qd_cint_t;
 
 /*
  * Create CINT interpreter
