@@ -1,0 +1,37 @@
+# Build directory
+build/
+
+# Object files
+*.o
+*.lo
+
+# Libraries
+*.a
+*.so
+*.la
+
+# Dependencies
+*.d
+
+# Kernel module artifacts
+*.ko
+*.mod.c
+*.mod.o
+*.mod
+modules.order
+Module.symvers
+.*.cmd
+.tmp_versions/
+
+# Executables (if any end up in root or source dirs)
+*.out
+examples/af_meta/src/meta_client
+examples/af_meta/src/meta_server
+examples/dhcp/src/qd_dhcpd
+
+# Editor temporary files
+*~
+*.swp
+*.swo
+.vscode/
+.idea/
