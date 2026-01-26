@@ -51,7 +51,7 @@ CLIENT_SHARED = $(BUILDDIR)/libqdclient.so
 
 EXAMPLES = $(BUILDDIR)/simple_daemon $(BUILDDIR)/multi_instance $(BUILDDIR)/kernel_comm \
            $(BUILDDIR)/meta_cli $(BUILDDIR)/meta_server $(BUILDDIR)/meta_client \
-           $(BUILDDIR)/qd_dhcpd
+           $(BUILDDIR)/qd_dhcpd $(BUILDDIR)/qd_dhcp_cli
 TESTS = $(BUILDDIR)/test_memory $(BUILDDIR)/test_threadpool $(BUILDDIR)/test_event $(BUILDDIR)/test_ipc
 
 .PHONY: all clean examples tests install kmod kmods
@@ -109,7 +109,20 @@ $(BUILDDIR)/meta_server: $(EXAMPLEDIR)/af_meta/src/meta_server.c $(LIB_STATIC)
 $(BUILDDIR)/meta_client: $(EXAMPLEDIR)/af_meta/src/meta_client.c $(LIB_STATIC) $(CLIENT_STATIC)
 	$(CC) $(CFLAGS) -I$(EXAMPLEDIR)/af_meta/include -I$(CLIENTDIR)/include $< -o $@ -L$(BUILDDIR) -lqdaemon -lqdclient $(LDFLAGS)
 
-$(BUILDDIR)/qd_dhcpd: $(EXAMPLEDIR)/dhcp/src/qd_dhcpd.c $(LIB_STATIC)
+# DHCP daemon sources
+DHCP_SRCS = $(EXAMPLEDIR)/dhcp/src/qd_dhcpd.c \
+            $(EXAMPLEDIR)/dhcp/src/dhcp_option.c \
+            $(EXAMPLEDIR)/dhcp/src/dhcp_pool.c \
+            $(EXAMPLEDIR)/dhcp/src/dhcp_lease.c \
+            $(EXAMPLEDIR)/dhcp/src/dhcp_server.c \
+            $(EXAMPLEDIR)/dhcp/src/dhcp_relay.c \
+            $(EXAMPLEDIR)/dhcp/src/dhcp_rest.c
+
+$(BUILDDIR)/qd_dhcpd: $(DHCP_SRCS) $(LIB_STATIC)
+	$(CC) $(CFLAGS) -I$(EXAMPLEDIR)/dhcp/include $(DHCP_SRCS) -o $@ -L$(BUILDDIR) -lqdaemon $(LDFLAGS)
+
+# DHCP CLI
+$(BUILDDIR)/qd_dhcp_cli: $(EXAMPLEDIR)/dhcp/cli/qd_dhcp_cli.c $(LIB_STATIC)
 	$(CC) $(CFLAGS) -I$(EXAMPLEDIR)/dhcp/include $< -o $@ -L$(BUILDDIR) -lqdaemon $(LDFLAGS)
 
 # Tests

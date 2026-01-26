@@ -1,6 +1,6 @@
 /*
  * QDaemon DHCP Server - Main Daemon
- * Uses QDaemon framework with custom netdev kernel module
+ * Professional DHCP server with relay support, CLI, and REST API
  */
 
 #include <stdio.h>
@@ -8,15 +8,24 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <signal.h>
 #include <arpa/inet.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <linux/netlink.h>
 #include <linux/genetlink.h>
 
 #include <qdaemon/qdaemon.h>
 #include <qdaemon/qd_handler.h>
 #include <qdaemon/qd_netlink.h>
+#include <qdaemon/qd_ipc.h>
 
 #include "dhcp_protocol.h"
+#include "dhcp_server.h"
+#include "dhcp_relay.h"
+#include "dhcp_pool.h"
+#include "dhcp_lease.h"
+#include "dhcp_ipc.h"
 
 /* Netlink commands matching kernel module */
 enum {
@@ -42,188 +51,440 @@ enum {
     QDHCP_ATTR_STATS,
 };
 
-/* DHCP Server State */
+/*
+ * Daemon Context
+ */
 typedef struct {
-    qd_daemon_t *daemon;
-    qd_netlink_t *netlink;
-    qd_handler_table_t *handlers;
-    
-    dhcp_config_t config;
-    dhcp_lease_t *leases;
-    int num_leases;
-    
-    uint8_t server_mac[6];
+    /* Framework components */
+    qd_daemon_t        *daemon;
+    qd_event_loop_t    *loop;
+    qd_netlink_t       *netlink;
+
+    /* DHCP components */
+    dhcp_server_t      *server;
+    dhcp_relay_t       *relay;
+
+    /* IPC Server */
+    int                 ipc_fd;
+    qd_handler_table_t *ipc_handlers;
+
+    /* Configuration */
+    struct {
+        bool            server_enabled;
+        bool            relay_enabled;
+        bool            foreground;
+        char            config_file[256];
+        char            lease_file[256];
+    } config;
+
+    /* Runtime state */
+    uint8_t             server_mac[6];
+    uint64_t            start_time;
+
 } qd_dhcpd_t;
 
 static qd_dhcpd_t g_dhcpd;
 
 /*
- * Lease Management
+ * Forward declarations
+ */
+static int send_dhcp_packet_cb(const uint8_t *packet, size_t len,
+                                const uint8_t *dst_mac, uint32_t dst_ip,
+                                bool broadcast, void *arg);
+static void on_packet_received(qd_netlink_t *nl, qd_netlink_msg_t *msg, void *arg);
+
+/* REST API initialization (from dhcp_rest.c) */
+extern void dhcp_rest_init(dhcp_server_t *server, dhcp_relay_t *relay);
+
+/*
+ * IPC Handlers
  */
 
-static dhcp_lease_t *lease_find_by_mac(const uint8_t *mac)
+static qd_handler_result_t ipc_handle_ping(qd_handler_ctx_t *ctx, void *arg)
 {
-    dhcp_lease_t *lease = g_dhcpd.leases;
-    while (lease) {
-        if (memcmp(lease->mac, mac, 6) == 0)
-            return lease;
-        lease = lease->next;
-    }
-    return NULL;
+    (void)arg;
+    ctx->status = DHCP_IPC_OK;
+    return QD_HANDLER_OK;
 }
 
-static dhcp_lease_t *lease_find_by_ip(uint32_t ip)
+/* Callback for lease iteration */
+static int lease_list_iter_cb(dhcp_lease_t *lease, void *arg)
 {
-    dhcp_lease_t *lease = g_dhcpd.leases;
-    while (lease) {
-        if (lease->ip == ip)
-            return lease;
-        lease = lease->next;
-    }
-    return NULL;
+    dhcp_ipc_lease_list_t *resp = (dhcp_ipc_lease_list_t *)arg;
+    dhcp_ipc_lease_entry_t *e = &resp->entries[resp->count];
+    e->ip = lease->ip;
+    memcpy(e->mac, lease->mac, 6);
+    e->state = lease->state;
+    e->lease_time = lease->lease_time;
+    e->start_time = lease->start_time;
+    e->expire_time = lease->expire_time;
+    memset(e->hostname, 0, sizeof(e->hostname));
+    memcpy(e->hostname, lease->hostname,
+           strlen(lease->hostname) < sizeof(e->hostname) - 1 ?
+           strlen(lease->hostname) : sizeof(e->hostname) - 1);
+    resp->count++;
+    return 0;
 }
 
-static uint32_t lease_allocate_ip(const uint8_t *mac)
+static qd_handler_result_t ipc_handle_lease_list(qd_handler_ctx_t *ctx, void *arg)
 {
-    /* Check if client already has a lease */
-    dhcp_lease_t *existing = lease_find_by_mac(mac);
-    if (existing && existing->state != LEASE_EXPIRED)
-        return existing->ip;
+    (void)arg;
+    dhcp_lease_db_t *db = dhcp_server_get_lease_db(g_dhcpd.server);
 
-    /* Find free IP in pool */
-    for (uint32_t ip = g_dhcpd.config.pool_start; 
-         ip <= g_dhcpd.config.pool_end; ip++) {
-        uint32_t net_ip = htonl(ip);
-        dhcp_lease_t *lease = lease_find_by_ip(net_ip);
-        if (!lease || lease->state == LEASE_FREE || lease->state == LEASE_EXPIRED)
-            return net_ip;
+    /* Count leases */
+    int count = dhcp_lease_count(db);
+
+    /* Allocate response */
+    size_t resp_size = sizeof(dhcp_ipc_lease_list_t) +
+                       count * sizeof(dhcp_ipc_lease_entry_t);
+    dhcp_ipc_lease_list_t *resp = qd_handler_ctx_alloc_response(ctx, resp_size);
+    if (!resp) {
+        ctx->status = DHCP_IPC_ERR_FAILED;
+        return QD_HANDLER_ERROR;
     }
 
-    return 0; /* No free IP */
+    resp->count = 0;
+
+    /* Fill in lease entries */
+    dhcp_lease_iterate(db, lease_list_iter_cb, resp);
+
+    ctx->response_len = sizeof(dhcp_ipc_lease_list_t) +
+                        resp->count * sizeof(dhcp_ipc_lease_entry_t);
+    ctx->status = DHCP_IPC_OK;
+
+    return QD_HANDLER_OK;
 }
 
-static dhcp_lease_t *lease_create(uint32_t ip, const uint8_t *mac, uint32_t lease_time)
+static qd_handler_result_t ipc_handle_lease_clear_all(qd_handler_ctx_t *ctx, void *arg)
 {
-    dhcp_lease_t *lease = calloc(1, sizeof(dhcp_lease_t));
-    if (!lease)
-        return NULL;
+    (void)arg;
 
-    lease->ip = ip;
-    memcpy(lease->mac, mac, 6);
-    lease->lease_time = lease_time;
-    lease->expire_time = qd_time_now() + (lease_time * 1000);
-    lease->state = LEASE_OFFERED;
+    dhcp_server_clear_all_leases(g_dhcpd.server);
 
-    /* Add to list */
-    lease->next = g_dhcpd.leases;
-    g_dhcpd.leases = lease;
-    g_dhcpd.num_leases++;
+    ctx->status = DHCP_IPC_OK;
+    qd_log_info("All leases cleared via IPC");
 
-    return lease;
+    return QD_HANDLER_OK;
+}
+
+static qd_handler_result_t ipc_handle_lease_clear_ip(qd_handler_ctx_t *ctx, void *arg)
+{
+    (void)arg;
+
+    dhcp_ipc_lease_clear_t *req = (dhcp_ipc_lease_clear_t *)ctx->data;
+
+    if (dhcp_server_clear_lease(g_dhcpd.server, req->ip) != 0) {
+        ctx->status = DHCP_IPC_ERR_NOT_FOUND;
+        return QD_HANDLER_OK;
+    }
+
+    struct in_addr addr = { .s_addr = req->ip };
+    qd_log_info("Lease cleared via IPC: %s", inet_ntoa(addr));
+
+    ctx->status = DHCP_IPC_OK;
+    return QD_HANDLER_OK;
+}
+
+static qd_handler_result_t ipc_handle_server_status(qd_handler_ctx_t *ctx, void *arg)
+{
+    (void)arg;
+
+    dhcp_ipc_server_status_t *resp = qd_handler_ctx_alloc_response(ctx, sizeof(*resp));
+    if (!resp) {
+        ctx->status = DHCP_IPC_ERR_FAILED;
+        return QD_HANDLER_ERROR;
+    }
+
+    memset(resp, 0, sizeof(*resp));
+
+    resp->running = 1;
+    resp->server_enabled = g_dhcpd.config.server_enabled;
+    resp->relay_enabled = g_dhcpd.config.relay_enabled;
+
+    const dhcp_server_config_t *cfg = dhcp_server_get_config(g_dhcpd.server);
+    resp->server_id = cfg->server_id;
+
+    uint64_t now = qd_time_now();
+    resp->uptime = (now - g_dhcpd.start_time) / 1000;
+
+    resp->num_pools = dhcp_server_get_pool_count(g_dhcpd.server);
+    resp->num_leases = dhcp_lease_count(dhcp_server_get_lease_db(g_dhcpd.server));
+
+    dhcp_server_stats_t stats;
+    dhcp_server_get_stats(g_dhcpd.server, &stats);
+    resp->discovers = stats.discovers;
+    resp->offers = stats.offers;
+    resp->requests = stats.requests;
+    resp->acks = stats.acks;
+    resp->naks = stats.naks;
+    resp->releases = stats.releases;
+    resp->declines = stats.declines;
+
+    ctx->response_len = sizeof(*resp);
+    ctx->status = DHCP_IPC_OK;
+
+    return QD_HANDLER_OK;
+}
+
+static qd_handler_result_t ipc_handle_relay_status(qd_handler_ctx_t *ctx, void *arg)
+{
+    (void)arg;
+
+    dhcp_ipc_relay_status_t *resp = qd_handler_ctx_alloc_response(ctx, sizeof(*resp));
+    if (!resp) {
+        ctx->status = DHCP_IPC_ERR_FAILED;
+        return QD_HANDLER_ERROR;
+    }
+
+    memset(resp, 0, sizeof(*resp));
+
+    if (g_dhcpd.relay) {
+        resp->enabled = dhcp_relay_is_enabled(g_dhcpd.relay);
+
+        /* Use local array to avoid packed member address warning */
+        uint32_t servers[DHCP_RELAY_MAX_SERVERS];
+        resp->num_servers = dhcp_relay_get_servers(g_dhcpd.relay,
+                                                    servers,
+                                                    DHCP_RELAY_MAX_SERVERS);
+        memcpy(resp->servers, servers, sizeof(resp->servers));
+
+        dhcp_relay_iface_t ifaces[DHCP_RELAY_MAX_IFACES];
+        resp->num_interfaces = dhcp_relay_get_interfaces(g_dhcpd.relay,
+                                                          ifaces,
+                                                          DHCP_RELAY_MAX_IFACES);
+        for (int i = 0; i < resp->num_interfaces; i++) {
+            memset(resp->interfaces[i].name, 0, sizeof(resp->interfaces[i].name));
+            size_t name_len = strlen(ifaces[i].name);
+            if (name_len >= sizeof(resp->interfaces[i].name))
+                name_len = sizeof(resp->interfaces[i].name) - 1;
+            memcpy(resp->interfaces[i].name, ifaces[i].name, name_len);
+            resp->interfaces[i].giaddr = ifaces[i].giaddr;
+            resp->interfaces[i].enabled = ifaces[i].enabled;
+        }
+
+        dhcp_relay_stats_t stats;
+        dhcp_relay_get_stats(g_dhcpd.relay, &stats);
+        resp->requests_forwarded = stats.requests_forwarded;
+        resp->replies_relayed = stats.replies_relayed;
+        resp->drops_max_hops = stats.drops_max_hops;
+        resp->drops_no_server = stats.drops_no_server;
+    }
+
+    ctx->response_len = sizeof(*resp);
+    ctx->status = DHCP_IPC_OK;
+
+    return QD_HANDLER_OK;
+}
+
+static qd_handler_result_t ipc_handle_relay_add_server(qd_handler_ctx_t *ctx, void *arg)
+{
+    (void)arg;
+
+    if (!g_dhcpd.relay) {
+        ctx->status = DHCP_IPC_ERR_FAILED;
+        return QD_HANDLER_OK;
+    }
+
+    dhcp_ipc_relay_server_t *req = (dhcp_ipc_relay_server_t *)ctx->data;
+
+    if (dhcp_relay_add_server(g_dhcpd.relay, req->server_ip) != 0) {
+        ctx->status = DHCP_IPC_ERR_FULL;
+        return QD_HANDLER_OK;
+    }
+
+    ctx->status = DHCP_IPC_OK;
+    return QD_HANDLER_OK;
+}
+
+static qd_handler_result_t ipc_handle_relay_add_interface(qd_handler_ctx_t *ctx, void *arg)
+{
+    (void)arg;
+
+    if (!g_dhcpd.relay) {
+        ctx->status = DHCP_IPC_ERR_FAILED;
+        return QD_HANDLER_OK;
+    }
+
+    dhcp_ipc_relay_interface_t *req = (dhcp_ipc_relay_interface_t *)ctx->data;
+
+    if (dhcp_relay_add_interface(g_dhcpd.relay, req->name, req->giaddr) != 0) {
+        ctx->status = DHCP_IPC_ERR_FAILED;
+        return QD_HANDLER_OK;
+    }
+
+    ctx->status = DHCP_IPC_OK;
+    return QD_HANDLER_OK;
+}
+
+/* IPC Handler Table */
+static const qd_handler_entry_t ipc_handler_entries[] = {
+    QD_HANDLER(DHCP_IPC_PING,                 ipc_handle_ping),
+    QD_HANDLER(DHCP_IPC_LEASE_LIST,           ipc_handle_lease_list),
+    QD_HANDLER(DHCP_IPC_LEASE_CLEAR_ALL,      ipc_handle_lease_clear_all),
+    QD_HANDLER(DHCP_IPC_LEASE_CLEAR_IP,       ipc_handle_lease_clear_ip),
+    QD_HANDLER(DHCP_IPC_SERVER_STATUS,        ipc_handle_server_status),
+    QD_HANDLER(DHCP_IPC_RELAY_STATUS,         ipc_handle_relay_status),
+    QD_HANDLER(DHCP_IPC_RELAY_ADD_SERVER,     ipc_handle_relay_add_server),
+    QD_HANDLER(DHCP_IPC_RELAY_ADD_INTERFACE,  ipc_handle_relay_add_interface),
+    QD_HANDLER_END()
+};
+
+/*
+ * IPC Server
+ */
+
+static void on_ipc_readable(int fd, uint32_t events, void *arg)
+{
+    (void)events;
+    (void)arg;
+
+    /* Accept new connection */
+    int client_fd = accept(fd, NULL, NULL);
+    if (client_fd < 0)
+        return;
+
+    /* Receive request */
+    dhcp_ipc_header_t header;
+    if (recv(client_fd, &header, sizeof(header), MSG_WAITALL) != sizeof(header)) {
+        close(client_fd);
+        return;
+    }
+
+    if (header.magic != DHCP_IPC_MAGIC) {
+        close(client_fd);
+        return;
+    }
+
+    /* Receive payload */
+    void *payload = NULL;
+    if (header.payload_len > 0) {
+        payload = malloc(header.payload_len);
+        if (!payload || recv(client_fd, payload, header.payload_len, MSG_WAITALL) !=
+            (ssize_t)header.payload_len) {
+            free(payload);
+            close(client_fd);
+            return;
+        }
+    }
+
+    /* Dispatch handler */
+    qd_handler_ctx_t ctx;
+    qd_handler_ctx_init(&ctx);
+    ctx.cmd = header.cmd;
+    ctx.data = payload;
+    ctx.len = header.payload_len;
+    ctx.seq = header.seq;
+
+    qd_handler_dispatch(g_dhcpd.ipc_handlers, &ctx);
+
+    /* Send response */
+    dhcp_ipc_header_t resp_header = {
+        .magic = DHCP_IPC_MAGIC,
+        .version = DHCP_IPC_VERSION,
+        .cmd = header.cmd,
+        .seq = header.seq,
+        .status = ctx.status,
+        .payload_len = ctx.response_len,
+    };
+
+    send(client_fd, &resp_header, sizeof(resp_header), 0);
+    if (ctx.response && ctx.response_len > 0) {
+        send(client_fd, ctx.response, ctx.response_len, 0);
+    }
+
+    free(payload);
+    free(ctx.response);
+    close(client_fd);
+}
+
+static int setup_ipc_server(void)
+{
+    /* Create Unix socket */
+    g_dhcpd.ipc_fd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (g_dhcpd.ipc_fd < 0) {
+        qd_log_error("Cannot create IPC socket: %s", strerror(errno));
+        return -1;
+    }
+
+    /* Remove existing socket file */
+    unlink(DHCP_IPC_SOCKET_PATH);
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, DHCP_IPC_SOCKET_PATH, sizeof(addr.sun_path) - 1);
+
+    if (bind(g_dhcpd.ipc_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        qd_log_error("Cannot bind IPC socket: %s", strerror(errno));
+        close(g_dhcpd.ipc_fd);
+        return -1;
+    }
+
+    if (listen(g_dhcpd.ipc_fd, 5) < 0) {
+        qd_log_error("Cannot listen on IPC socket: %s", strerror(errno));
+        close(g_dhcpd.ipc_fd);
+        return -1;
+    }
+
+    /* Create handler table */
+    g_dhcpd.ipc_handlers = qd_handler_table_create("dhcp_ipc");
+    qd_handler_register_table(g_dhcpd.ipc_handlers, ipc_handler_entries);
+
+    /* Register with event loop */
+    g_dhcpd.loop = qd_daemon_get_loop(g_dhcpd.daemon);
+    qd_event_add(g_dhcpd.loop, g_dhcpd.ipc_fd, QD_EVENT_READ, on_ipc_readable, NULL);
+
+    qd_log_info("IPC server listening on %s", DHCP_IPC_SOCKET_PATH);
+
+    return 0;
 }
 
 /*
- * DHCP Packet Building
+ * Packet Send Callback
  */
 
-static int build_dhcp_reply(dhcp_packet_t *reply, const dhcp_packet_t *request,
-                            uint8_t msg_type, uint32_t offered_ip)
+static int send_dhcp_packet_cb(const uint8_t *packet, size_t len,
+                                const uint8_t *dst_mac, uint32_t dst_ip,
+                                bool broadcast, void *arg)
 {
-    memset(reply, 0, sizeof(*reply));
+    (void)dst_mac;
+    (void)dst_ip;
+    (void)broadcast;
+    (void)arg;
 
-    reply->op = DHCP_BOOTREPLY;
-    reply->htype = DHCP_HTYPE_ETHER;
-    reply->hlen = 6;
-    reply->xid = request->xid;
-    reply->yiaddr = offered_ip;
-    reply->siaddr = g_dhcpd.config.server_ip;
-    memcpy(reply->chaddr, request->chaddr, 16);
-    reply->magic = htonl(DHCP_MAGIC_COOKIE);
-
-    /* Build options */
-    uint8_t *opt = reply->options;
-    int idx = 0;
-
-    /* Message type */
-    opt[idx++] = DHCP_OPT_MSG_TYPE;
-    opt[idx++] = 1;
-    opt[idx++] = msg_type;
-
-    /* Server identifier */
-    opt[idx++] = DHCP_OPT_SERVER_ID;
-    opt[idx++] = 4;
-    memcpy(&opt[idx], &g_dhcpd.config.server_ip, 4);
-    idx += 4;
-
-    /* Lease time */
-    opt[idx++] = DHCP_OPT_LEASE_TIME;
-    opt[idx++] = 4;
-    uint32_t lease_time = htonl(g_dhcpd.config.default_lease);
-    memcpy(&opt[idx], &lease_time, 4);
-    idx += 4;
-
-    /* Subnet mask */
-    opt[idx++] = DHCP_OPT_SUBNET_MASK;
-    opt[idx++] = 4;
-    memcpy(&opt[idx], &g_dhcpd.config.subnet_mask, 4);
-    idx += 4;
-
-    /* Router */
-    if (g_dhcpd.config.gateway) {
-        opt[idx++] = DHCP_OPT_ROUTER;
-        opt[idx++] = 4;
-        memcpy(&opt[idx], &g_dhcpd.config.gateway, 4);
-        idx += 4;
-    }
-
-    /* DNS */
-    if (g_dhcpd.config.dns_server) {
-        opt[idx++] = DHCP_OPT_DNS;
-        opt[idx++] = 4;
-        memcpy(&opt[idx], &g_dhcpd.config.dns_server, 4);
-        idx += 4;
-    }
-
-    /* End */
-    opt[idx++] = DHCP_OPT_END;
-
-    return sizeof(dhcp_packet_t) - 308 + idx;
-}
-
-/*
- * Send packet via kernel netdev
- */
-
-static int send_dhcp_packet(dhcp_packet_t *pkt, size_t len,
-                            const uint8_t *dst_mac, uint32_t dst_ip)
-{
     /* Build full ethernet/IP/UDP packet */
-    uint8_t packet[1500];
+    uint8_t full_packet[1500];
     size_t offset = 0;
 
     /* Ethernet header */
-    eth_header_t *eth = (eth_header_t *)packet;
-    memcpy(eth->dst, dst_mac, 6);
+    eth_header_t *eth = (eth_header_t *)full_packet;
+    if (broadcast) {
+        memset(eth->dst, 0xff, 6);
+    } else {
+        memcpy(eth->dst, dst_mac, 6);
+    }
     memcpy(eth->src, g_dhcpd.server_mac, 6);
-    eth->type = htons(0x0800); /* IP */
+    eth->type = htons(0x0800);
     offset += sizeof(eth_header_t);
 
     /* IP header */
-    ip_header_t *ip = (ip_header_t *)(packet + offset);
+    ip_header_t *ip = (ip_header_t *)(full_packet + offset);
     ip->ihl_version = 0x45;
     ip->tos = 0;
     ip->tot_len = htons(sizeof(ip_header_t) + sizeof(udp_header_t) + len);
     ip->id = htons(rand());
     ip->frag_off = 0;
     ip->ttl = 64;
-    ip->protocol = 17; /* UDP */
-    ip->saddr = g_dhcpd.config.server_ip;
-    ip->daddr = dst_ip;
-    ip->check = 0; /* Let kernel calculate */
+    ip->protocol = 17;  /* UDP */
+    ip->check = 0;
+
+    const dhcp_server_config_t *cfg = dhcp_server_get_config(g_dhcpd.server);
+    ip->saddr = cfg->server_id;
+    ip->daddr = broadcast ? INADDR_BROADCAST : dst_ip;
     offset += sizeof(ip_header_t);
 
     /* UDP header */
-    udp_header_t *udp = (udp_header_t *)(packet + offset);
+    udp_header_t *udp = (udp_header_t *)(full_packet + offset);
     udp->source = htons(DHCP_SERVER_PORT);
     udp->dest = htons(DHCP_CLIENT_PORT);
     udp->len = htons(sizeof(udp_header_t) + len);
@@ -231,169 +492,19 @@ static int send_dhcp_packet(dhcp_packet_t *pkt, size_t len,
     offset += sizeof(udp_header_t);
 
     /* DHCP payload */
-    memcpy(packet + offset, pkt, len);
+    memcpy(full_packet + offset, packet, len);
     offset += len;
 
-    /* Send via netlink to kernel module */
+    /* Send via netlink */
     qd_netlink_msg_t msg;
     qd_netlink_msg_init(&msg, QDHCP_CMD_PACKET_DOWN);
-    qd_netlink_msg_add_attr(&msg, QDHCP_ATTR_PACKET, packet, offset);
+    qd_netlink_msg_add_attr(&msg, QDHCP_ATTR_PACKET, full_packet, offset);
 
     return qd_netlink_send_msg(g_dhcpd.netlink, &msg);
 }
 
 /*
- * DHCP Message Handlers
- */
-
-static qd_handler_result_t handle_discover(qd_handler_ctx_t *ctx, void *arg)
-{
-    (void)arg;
-    dhcp_packet_t *request = (dhcp_packet_t *)ctx->data;
-
-    qd_log_info("DHCP DISCOVER from %02x:%02x:%02x:%02x:%02x:%02x",
-                request->chaddr[0], request->chaddr[1], request->chaddr[2],
-                request->chaddr[3], request->chaddr[4], request->chaddr[5]);
-
-    /* Allocate IP address */
-    uint32_t offered_ip = lease_allocate_ip(request->chaddr);
-    if (!offered_ip) {
-        qd_log_warn("No IP available for client");
-        return QD_HANDLER_ERROR;
-    }
-
-    /* Create lease */
-    dhcp_lease_t *lease = lease_find_by_ip(offered_ip);
-    if (!lease) {
-        lease = lease_create(offered_ip, request->chaddr, g_dhcpd.config.default_lease);
-        if (!lease)
-            return QD_HANDLER_ERROR;
-    }
-    lease->state = LEASE_OFFERED;
-
-    /* Build and send OFFER */
-    dhcp_packet_t reply;
-    int len = build_dhcp_reply(&reply, request, DHCP_OFFER, offered_ip);
-
-    /* Send to broadcast or unicast */
-    uint8_t dst_mac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
-    send_dhcp_packet(&reply, len, dst_mac, INADDR_BROADCAST);
-
-    struct in_addr addr = { .s_addr = offered_ip };
-    qd_log_info("DHCP OFFER sent: %s", inet_ntoa(addr));
-
-    return QD_HANDLER_OK;
-}
-
-static qd_handler_result_t handle_request(qd_handler_ctx_t *ctx, void *arg)
-{
-    (void)arg;
-    dhcp_packet_t *request = (dhcp_packet_t *)ctx->data;
-
-    qd_log_info("DHCP REQUEST from %02x:%02x:%02x:%02x:%02x:%02x",
-                request->chaddr[0], request->chaddr[1], request->chaddr[2],
-                request->chaddr[3], request->chaddr[4], request->chaddr[5]);
-
-    /* Find requested IP */
-    uint32_t requested_ip = dhcp_get_requested_ip(request);
-    if (!requested_ip)
-        requested_ip = request->ciaddr;
-
-    /* Find lease */
-    dhcp_lease_t *lease = lease_find_by_mac(request->chaddr);
-    
-    uint8_t msg_type;
-    if (lease && lease->ip == requested_ip) {
-        /* ACK the request */
-        lease->state = LEASE_BOUND;
-        lease->expire_time = qd_time_now() + (lease->lease_time * 1000);
-        msg_type = DHCP_ACK;
-        qd_log_info("DHCP ACK");
-    } else {
-        /* NAK - client requested wrong IP */
-        msg_type = DHCP_NAK;
-        requested_ip = 0;
-        qd_log_warn("DHCP NAK - invalid request");
-    }
-
-    /* Build and send reply */
-    dhcp_packet_t reply;
-    int len = build_dhcp_reply(&reply, request, msg_type, requested_ip);
-
-    uint8_t dst_mac[6] = {0xff, 0xff, 0xff, 0xff, 0xff, 0xff};
-    send_dhcp_packet(&reply, len, dst_mac, INADDR_BROADCAST);
-
-    return QD_HANDLER_OK;
-}
-
-static qd_handler_result_t handle_release(qd_handler_ctx_t *ctx, void *arg)
-{
-    (void)arg;
-    dhcp_packet_t *request = (dhcp_packet_t *)ctx->data;
-
-    qd_log_info("DHCP RELEASE from %02x:%02x:%02x:%02x:%02x:%02x",
-                request->chaddr[0], request->chaddr[1], request->chaddr[2],
-                request->chaddr[3], request->chaddr[4], request->chaddr[5]);
-
-    dhcp_lease_t *lease = lease_find_by_mac(request->chaddr);
-    if (lease) {
-        lease->state = LEASE_FREE;
-        struct in_addr addr = { .s_addr = lease->ip };
-        qd_log_info("Released IP: %s", inet_ntoa(addr));
-    }
-
-    return QD_HANDLER_OK;
-}
-
-static qd_handler_result_t handle_decline(qd_handler_ctx_t *ctx, void *arg)
-{
-    (void)arg;
-    dhcp_packet_t *request = (dhcp_packet_t *)ctx->data;
-
-    qd_log_warn("DHCP DECLINE from %02x:%02x:%02x:%02x:%02x:%02x",
-                request->chaddr[0], request->chaddr[1], request->chaddr[2],
-                request->chaddr[3], request->chaddr[4], request->chaddr[5]);
-
-    /* Mark IP as problematic */
-    uint32_t declined_ip = dhcp_get_requested_ip(request);
-    dhcp_lease_t *lease = lease_find_by_ip(declined_ip);
-    if (lease) {
-        lease->state = LEASE_EXPIRED;
-    }
-
-    return QD_HANDLER_OK;
-}
-
-static qd_handler_result_t handle_inform(qd_handler_ctx_t *ctx, void *arg)
-{
-    (void)arg;
-    dhcp_packet_t *request = (dhcp_packet_t *)ctx->data;
-
-    qd_log_info("DHCP INFORM from %02x:%02x:%02x:%02x:%02x:%02x",
-                request->chaddr[0], request->chaddr[1], request->chaddr[2],
-                request->chaddr[3], request->chaddr[4], request->chaddr[5]);
-
-    /* Send ACK with network config but no IP */
-    dhcp_packet_t reply;
-    int len = build_dhcp_reply(&reply, request, DHCP_ACK, request->ciaddr);
-
-    send_dhcp_packet(&reply, len, request->chaddr, request->ciaddr);
-
-    return QD_HANDLER_OK;
-}
-
-/* DHCP handler table */
-static const qd_handler_entry_t dhcp_handlers[] = {
-    QD_HANDLER(DHCP_DISCOVER, handle_discover),
-    QD_HANDLER(DHCP_REQUEST,  handle_request),
-    QD_HANDLER(DHCP_RELEASE,  handle_release),
-    QD_HANDLER(DHCP_DECLINE,  handle_decline),
-    QD_HANDLER(DHCP_INFORM,   handle_inform),
-    QD_HANDLER_END()
-};
-
-/*
- * Netlink packet handler
+ * Packet Reception
  */
 
 static void on_packet_received(qd_netlink_t *nl, qd_netlink_msg_t *msg, void *arg)
@@ -407,47 +518,99 @@ static void on_packet_received(qd_netlink_t *nl, qd_netlink_msg_t *msg, void *ar
     /* Get packet data */
     size_t pkt_len;
     void *pkt_data = qd_netlink_msg_get_data(msg, QDHCP_ATTR_PACKET, &pkt_len);
-    if (!pkt_data || pkt_len < sizeof(eth_header_t) + sizeof(ip_header_t) + 
-                                sizeof(udp_header_t) + sizeof(dhcp_packet_t)) {
+    if (!pkt_data)
         return;
-    }
 
-    /* Skip ethernet, IP, UDP headers to get DHCP packet */
+    /* Skip Ethernet/IP/UDP headers */
     size_t header_len = sizeof(eth_header_t) + sizeof(ip_header_t) + sizeof(udp_header_t);
+    if (pkt_len < header_len + sizeof(dhcp_packet_t))
+        return;
+
     dhcp_packet_t *dhcp = (dhcp_packet_t *)((uint8_t *)pkt_data + header_len);
 
     /* Verify DHCP magic */
     if (ntohl(dhcp->magic) != DHCP_MAGIC_COOKIE)
         return;
 
-    /* Get message type and dispatch */
-    int msg_type = dhcp_get_msg_type(dhcp);
-    if (msg_type < 0)
-        return;
+    /* Extract RX info */
+    dhcp_rx_info_t rx_info;
+    memset(&rx_info, 0, sizeof(rx_info));
 
-    qd_handler_ctx_t ctx;
-    qd_handler_ctx_init(&ctx);
-    ctx.cmd = msg_type;
-    ctx.data = dhcp;
-    ctx.len = pkt_len - header_len;
+    eth_header_t *eth = (eth_header_t *)pkt_data;
+    memcpy(rx_info.src_mac, eth->src, 6);
+    memcpy(rx_info.dst_mac, eth->dst, 6);
 
-    qd_handler_dispatch(g_dhcpd.handlers, &ctx);
+    ip_header_t *ip = (ip_header_t *)((uint8_t *)pkt_data + sizeof(eth_header_t));
+    rx_info.src_ip = ip->saddr;
+    rx_info.dst_ip = ip->daddr;
+
+    /* Check if this is a relay packet or direct client request */
+    if (dhcp->giaddr != 0 && g_dhcpd.relay) {
+        /* Server reply from upstream - relay to client */
+        dhcp_relay_process_server_packet(g_dhcpd.relay, dhcp, pkt_len - header_len);
+    } else if (g_dhcpd.config.relay_enabled && g_dhcpd.relay && dhcp->op == DHCP_BOOTREQUEST) {
+        /* Client request - check if we should relay */
+        /* Get interface index from netlink */
+        size_t attr_len;
+        void *ifindex_attr = qd_netlink_msg_get_data(msg, QDHCP_ATTR_IFINDEX, &attr_len);
+        int ifindex = ifindex_attr ? *(int *)ifindex_attr : 0;
+
+        dhcp_relay_process_client_packet(g_dhcpd.relay, dhcp,
+                                          pkt_len - header_len, ifindex);
+    } else if (g_dhcpd.config.server_enabled) {
+        /* Process as server */
+        dhcp_server_process_packet(g_dhcpd.server, dhcp, &rx_info);
+    }
 }
 
 /*
- * Daemon callbacks
+ * Daemon Callbacks
  */
 
 static int on_init(qd_daemon_t *daemon, void *arg)
 {
     (void)arg;
-    qd_log_info("DHCP server initializing...");
+
+    qd_log_info("DHCP daemon initializing...");
 
     g_dhcpd.daemon = daemon;
+    g_dhcpd.start_time = qd_time_now();
 
-    /* Create handler table */
-    g_dhcpd.handlers = qd_handler_table_create("dhcp");
-    qd_handler_register_table(g_dhcpd.handlers, dhcp_handlers);
+    /* Create DHCP server */
+    dhcp_server_config_t server_cfg = DHCP_SERVER_CONFIG_DEFAULT;
+    inet_pton(AF_INET, "192.168.100.1", &server_cfg.server_id);
+
+    g_dhcpd.server = dhcp_server_create(&server_cfg);
+    if (!g_dhcpd.server) {
+        qd_log_error("Failed to create DHCP server");
+        return -1;
+    }
+
+    /* Set send callback */
+    dhcp_server_set_send_callback(g_dhcpd.server, send_dhcp_packet_cb, NULL);
+
+    /* Create default pool */
+    dhcp_pool_config_t pool_cfg = DHCP_POOL_CONFIG_DEFAULT;
+    strcpy(pool_cfg.name, "default");
+    inet_pton(AF_INET, "192.168.100.0", &pool_cfg.network);
+    inet_pton(AF_INET, "255.255.255.0", &pool_cfg.netmask);
+    inet_pton(AF_INET, "192.168.100.10", &pool_cfg.range_start);
+    inet_pton(AF_INET, "192.168.100.250", &pool_cfg.range_end);
+    inet_pton(AF_INET, "192.168.100.1", &pool_cfg.gateway);
+    inet_pton(AF_INET, "8.8.8.8", &pool_cfg.dns_servers[0]);
+    pool_cfg.num_dns = 1;
+    strcpy(pool_cfg.domain, "local");
+    pool_cfg.default_lease = 3600;
+    pool_cfg.max_lease = 86400;
+
+    dhcp_pool_t *pool = dhcp_pool_create(&pool_cfg);
+    if (pool) {
+        dhcp_server_add_pool(g_dhcpd.server, pool);
+    }
+
+    /* Create relay agent */
+    dhcp_relay_config_t relay_cfg = DHCP_RELAY_CONFIG_DEFAULT;
+    g_dhcpd.relay = dhcp_relay_create(&relay_cfg);
 
     /* Connect to kernel module */
     g_dhcpd.netlink = qd_netlink_create("QDHCP");
@@ -460,7 +623,7 @@ static int on_init(qd_daemon_t *daemon, void *arg)
     /* Set packet callback */
     qd_netlink_set_callback(g_dhcpd.netlink, on_packet_received, NULL);
 
-    /* Register with kernel module */
+    /* Register with kernel */
     qd_netlink_msg_t msg;
     qd_netlink_msg_init(&msg, QDHCP_CMD_REGISTER);
     if (qd_netlink_send_msg(g_dhcpd.netlink, &msg) != QD_OK) {
@@ -468,7 +631,28 @@ static int on_init(qd_daemon_t *daemon, void *arg)
         return -1;
     }
 
-    qd_log_info("DHCP server initialized, listening on qdhcp0");
+    /* Setup IPC server */
+    if (setup_ipc_server() != 0) {
+        qd_log_error("Failed to setup IPC server");
+        return -1;
+    }
+
+    /* Initialize REST API */
+    dhcp_rest_init(g_dhcpd.server, g_dhcpd.relay);
+
+    /* Generate server MAC */
+    g_dhcpd.server_mac[0] = 0x02;  /* Locally administered */
+    for (int i = 1; i < 6; i++)
+        g_dhcpd.server_mac[i] = rand() & 0xff;
+
+    g_dhcpd.config.server_enabled = true;
+    g_dhcpd.config.relay_enabled = false;
+
+    qd_log_info("DHCP daemon initialized successfully");
+    qd_log_info("  Server mode: enabled");
+    qd_log_info("  Relay mode: disabled");
+    qd_log_info("  Pools: %d", dhcp_server_get_pool_count(g_dhcpd.server));
+
     return 0;
 }
 
@@ -476,7 +660,18 @@ static void on_shutdown(qd_daemon_t *daemon, void *arg)
 {
     (void)daemon;
     (void)arg;
-    qd_log_info("DHCP server shutting down...");
+
+    qd_log_info("DHCP daemon shutting down...");
+
+    /* Close IPC */
+    if (g_dhcpd.ipc_fd >= 0) {
+        qd_event_del_fd(g_dhcpd.loop, g_dhcpd.ipc_fd);
+        close(g_dhcpd.ipc_fd);
+        unlink(DHCP_IPC_SOCKET_PATH);
+    }
+
+    if (g_dhcpd.ipc_handlers)
+        qd_handler_table_destroy(g_dhcpd.ipc_handlers);
 
     /* Unregister from kernel */
     if (g_dhcpd.netlink) {
@@ -486,56 +681,61 @@ static void on_shutdown(qd_daemon_t *daemon, void *arg)
         qd_netlink_destroy(g_dhcpd.netlink);
     }
 
-    /* Cleanup handler table */
-    if (g_dhcpd.handlers)
-        qd_handler_table_destroy(g_dhcpd.handlers);
+    /* Destroy DHCP components */
+    if (g_dhcpd.relay)
+        dhcp_relay_destroy(g_dhcpd.relay);
 
-    /* Free leases */
-    dhcp_lease_t *lease = g_dhcpd.leases;
-    while (lease) {
-        dhcp_lease_t *next = lease->next;
-        free(lease);
-        lease = next;
-    }
+    if (g_dhcpd.server)
+        dhcp_server_destroy(g_dhcpd.server);
+
+    qd_log_info("DHCP daemon shutdown complete");
 }
+
+/*
+ * Usage
+ */
 
 static void print_usage(const char *prog)
 {
+    printf("QDaemon DHCP Server v1.0\n");
+    printf("\n");
     printf("Usage: %s [options]\n", prog);
+    printf("\n");
+    printf("Options:\n");
     printf("  -f, --foreground   Run in foreground\n");
-    printf("  -c <config>        Configuration file\n");
+    printf("  -c <file>          Configuration file\n");
+    printf("  -l <file>          Lease file path\n");
     printf("  -h, --help         Show this help\n");
+    printf("\n");
+    printf("Modes:\n");
+    printf("  Server mode: Provides DHCP addresses to clients\n");
+    printf("  Relay mode:  Forwards DHCP requests to upstream server\n");
+    printf("\n");
+    printf("Use qd_dhcp_cli for runtime management.\n");
 }
+
+/*
+ * Main
+ */
 
 int main(int argc, char **argv)
 {
-    /* Default configuration */
     memset(&g_dhcpd, 0, sizeof(g_dhcpd));
-    
-    /* Default DHCP settings - 192.168.100.0/24 */
-    inet_pton(AF_INET, "192.168.100.1", &g_dhcpd.config.server_ip);
-    inet_pton(AF_INET, "255.255.255.0", &g_dhcpd.config.subnet_mask);
-    inet_pton(AF_INET, "192.168.100.1", &g_dhcpd.config.gateway);
-    inet_pton(AF_INET, "8.8.8.8", &g_dhcpd.config.dns_server);
-    g_dhcpd.config.pool_start = ntohl(inet_addr("192.168.100.10"));
-    g_dhcpd.config.pool_end = ntohl(inet_addr("192.168.100.250"));
-    g_dhcpd.config.default_lease = 3600;  /* 1 hour */
-    g_dhcpd.config.max_lease = 86400;     /* 24 hours */
+    g_dhcpd.ipc_fd = -1;
 
-    /* Generate server MAC */
-    g_dhcpd.server_mac[0] = 0x02;  /* Locally administered */
-    for (int i = 1; i < 6; i++)
-        g_dhcpd.server_mac[i] = rand() & 0xff;
+    /* Default configuration */
+    strcpy(g_dhcpd.config.lease_file, "/var/lib/qd_dhcpd/leases");
 
-    /* Parse arguments */
+    /* Daemon configuration */
     qd_daemon_config_t config = QD_DAEMON_CONFIG_DEFAULT;
     config.name = "qd_dhcpd";
     config.version = "1.0.0";
-    config.description = "QDaemon DHCP Server";
+    config.description = "QDaemon Professional DHCP Server";
     config.pid_file = "/tmp/qd_dhcpd.pid";
     config.log_to_stderr = 1;
     config.log_level = QD_LOG_DEBUG;
 
+    /* Parse arguments */
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
@@ -543,6 +743,15 @@ int main(int argc, char **argv)
         }
         if (strcmp(argv[i], "-f") == 0 || strcmp(argv[i], "--foreground") == 0) {
             config.foreground = 1;
+            g_dhcpd.config.foreground = true;
+        }
+        if (strcmp(argv[i], "-c") == 0 && i + 1 < argc) {
+            strncpy(g_dhcpd.config.config_file, argv[++i],
+                    sizeof(g_dhcpd.config.config_file) - 1);
+        }
+        if (strcmp(argv[i], "-l") == 0 && i + 1 < argc) {
+            strncpy(g_dhcpd.config.lease_file, argv[++i],
+                    sizeof(g_dhcpd.config.lease_file) - 1);
         }
     }
 
