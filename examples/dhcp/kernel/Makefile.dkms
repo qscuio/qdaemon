@@ -1,0 +1,3 @@
+# DKMS Makefile for qd_dhcp_kmod
+obj-m := qd_dhcp_kmod.o
+ccflags-y := -I$(src)

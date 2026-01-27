@@ -13,7 +13,12 @@
 #include <sys/un.h>
 #include <arpa/inet.h>
 
+#ifdef STANDALONE
+#include "qdaemon_stub.h"
+#else
 #include <qdaemon/qd_cli.h>
+#endif
+
 #include "dhcp_ipc.h"
 #include "dhcp_protocol.h"
 

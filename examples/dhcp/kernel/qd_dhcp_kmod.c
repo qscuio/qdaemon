@@ -1,7 +1,19 @@
 /*
- * QDaemon DHCP Kernel Module - Custom Network Device
- * Virtual network device for DHCP packet capture/injection
- * Uses netlink to communicate with userspace daemon
+ * QDaemon DHCP Kernel Module
+ *
+ * Features:
+ * - Virtual network device (qdhcp0) for userspace communication
+ * - DHCP packet interception via:
+ *   1. dev_add_pack() - Protocol handler for ETH_P_IP
+ *   2. TC ingress hook - Traffic control classifier
+ * - Metadata header prepended to packets for raw socket communication
+ * - Direct TX via dev_queue_xmit() (bypasses TCP/IP stack)
+ * - DHCP snooping binding table
+ * - Netlink for control commands only
+ *
+ * Packet Flow:
+ *   RX: Physical NIC -> intercept -> [META_HDR][ETH][IP][UDP][DHCP] -> qdhcp0 -> raw socket
+ *   TX: raw socket -> qdhcp0 -> parse [META_HDR] -> dev_queue_xmit -> Physical NIC
  */
 
 #include <linux/module.h>
@@ -11,155 +23,523 @@
 #include <linux/etherdevice.h>
 #include <linux/skbuff.h>
 #include <linux/if_ether.h>
+#include <linux/if_vlan.h>
 #include <linux/ip.h>
 #include <linux/udp.h>
+#include <linux/hashtable.h>
 #include <net/genetlink.h>
 #include <net/netlink.h>
+#include <net/pkt_cls.h>
+#include <net/sch_generic.h>
+
+#include "../include/dhcp_kmod.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("QDaemon");
-MODULE_DESCRIPTION("DHCP Virtual Network Device with Netlink Interface");
-MODULE_VERSION("1.0");
+MODULE_DESCRIPTION("DHCP Virtual Network Device with Snooping Support");
+MODULE_VERSION("2.0");
 
-#define QDHCP_DEV_NAME       "qdhcp0"
-#define QDHCP_GENL_NAME      "QDHCP"
-#define QDHCP_GENL_VERSION   1
-#define QDHCP_MC_GROUP       "packets"
+/*
+ * Module parameters
+ */
+static int intercept_method = QDHCP_METHOD_BOTH;
+module_param(intercept_method, int, 0644);
+MODULE_PARM_DESC(intercept_method, "Interception method: 1=dev_add_pack, 2=TC, 3=both");
 
-/* Netlink commands */
-enum {
-    QDHCP_CMD_UNSPEC,
-    QDHCP_CMD_REGISTER,      /* Register userspace daemon */
-    QDHCP_CMD_UNREGISTER,    /* Unregister daemon */
-    QDHCP_CMD_PACKET_UP,     /* Packet from kernel to user */
-    QDHCP_CMD_PACKET_DOWN,   /* Packet from user to kernel */
-    QDHCP_CMD_SET_CONFIG,    /* Configure device */
-    QDHCP_CMD_GET_STATS,     /* Get statistics */
-    __QDHCP_CMD_MAX,
-};
-#define QDHCP_CMD_MAX (__QDHCP_CMD_MAX - 1)
+/*
+ * Constants
+ */
+#define DHCP_SERVER_PORT     67
+#define DHCP_CLIENT_PORT     68
+#define BINDING_HASH_BITS    8
+#define MAX_INTERFACES       32
 
-/* Netlink attributes */
-enum {
-    QDHCP_ATTR_UNSPEC,
-    QDHCP_ATTR_PACKET,       /* Raw packet data */
-    QDHCP_ATTR_IFINDEX,      /* Interface index */
-    QDHCP_ATTR_TIMESTAMP,    /* Packet timestamp */
-    QDHCP_ATTR_MAC_SRC,      /* Source MAC */
-    QDHCP_ATTR_MAC_DST,      /* Destination MAC */
-    QDHCP_ATTR_PKT_TYPE,     /* Packet type (DHCP msg type) */
-    QDHCP_ATTR_MTU,          /* MTU setting */
-    QDHCP_ATTR_STATS,        /* Statistics */
-    __QDHCP_ATTR_MAX,
-};
-#define QDHCP_ATTR_MAX (__QDHCP_ATTR_MAX - 1)
-
-/* Statistics structure */
-struct qdhcp_stats {
-    u64 rx_packets;
-    u64 tx_packets;
-    u64 rx_bytes;
-    u64 tx_bytes;
-    u64 rx_dropped;
-    u64 tx_dropped;
-    u64 dhcp_discover;
-    u64 dhcp_offer;
-    u64 dhcp_request;
-    u64 dhcp_ack;
-    u64 dhcp_nak;
-    u64 dhcp_release;
+/*
+ * Binding Table Entry
+ */
+struct binding_entry {
+    struct hlist_node hash_node;
+    u8 mac[ETH_ALEN];
+    __be32 ip;
+    int ifindex;
+    u32 lease_time;
+    u64 expire_time_ns;
 };
 
-/* Per-device private data */
+/*
+ * Monitored Interface Entry
+ */
+struct monitored_iface {
+    int ifindex;
+    char ifname[IFNAMSIZ];
+    bool trusted;
+    bool active;
+};
+
+/*
+ * Per-device private data
+ */
 struct qdhcp_priv {
     struct net_device *netdev;
     struct qdhcp_stats stats;
-    u32 daemon_pid;           /* PID of registered daemon */
-    u32 daemon_portid;        /* Netlink port ID */
     spinlock_t lock;
     bool daemon_registered;
+
+    /* Binding table */
+    DECLARE_HASHTABLE(bindings, BINDING_HASH_BITS);
+    spinlock_t bind_lock;
+    int bind_count;
+
+    /* Monitored interfaces */
+    struct monitored_iface ifaces[MAX_INTERFACES];
+    int iface_count;
+    spinlock_t iface_lock;
+
+    /* Interception method */
+    u8 method;
 };
 
 /* Global state */
 static struct net_device *qdhcp_netdev;
 static struct genl_family qdhcp_genl_family;
-
-/* Netlink attribute policy */
-static struct nla_policy qdhcp_genl_policy[QDHCP_ATTR_MAX + 1] = {
-    [QDHCP_ATTR_PACKET]    = { .type = NLA_BINARY, .len = 1500 },
-    [QDHCP_ATTR_IFINDEX]   = { .type = NLA_U32 },
-    [QDHCP_ATTR_TIMESTAMP] = { .type = NLA_U64 },
-    [QDHCP_ATTR_MAC_SRC]   = { .type = NLA_BINARY, .len = ETH_ALEN },
-    [QDHCP_ATTR_MAC_DST]   = { .type = NLA_BINARY, .len = ETH_ALEN },
-    [QDHCP_ATTR_PKT_TYPE]  = { .type = NLA_U8 },
-    [QDHCP_ATTR_MTU]       = { .type = NLA_U32 },
-    [QDHCP_ATTR_STATS]     = { .type = NLA_BINARY },
-};
-
-/* Multicast group */
-static struct genl_multicast_group qdhcp_genl_mcgrps[] = {
-    { .name = QDHCP_MC_GROUP, },
-};
+static struct packet_type qdhcp_ptype;
+static bool ptype_registered;
 
 /*
- * Forward packets to userspace daemon via netlink
+ * Hash function for MAC address
  */
-static int qdhcp_forward_to_user(struct net_device *dev, struct sk_buff *skb)
+static inline u32 mac_hash(const u8 *mac)
 {
-    struct qdhcp_priv *priv = netdev_priv(dev);
-    struct sk_buff *nlskb;
-    void *hdr;
-    ktime_t now;
-
-    if (!priv->daemon_registered)
-        return -ENOENT;
-
-    nlskb = genlmsg_new(NLMSG_GOODSIZE + skb->len, GFP_ATOMIC);
-    if (!nlskb)
-        return -ENOMEM;
-
-    hdr = genlmsg_put(nlskb, 0, 0, &qdhcp_genl_family, 0, QDHCP_CMD_PACKET_UP);
-    if (!hdr) {
-        nlmsg_free(nlskb);
-        return -EMSGSIZE;
-    }
-
-    /* Add packet data */
-    if (nla_put(nlskb, QDHCP_ATTR_PACKET, skb->len, skb->data))
-        goto nla_fail;
-
-    /* Add metadata */
-    if (nla_put_u32(nlskb, QDHCP_ATTR_IFINDEX, dev->ifindex))
-        goto nla_fail;
-
-    now = ktime_get_real();
-    if (nla_put_u64_64bit(nlskb, QDHCP_ATTR_TIMESTAMP, ktime_to_ns(now), 0))
-        goto nla_fail;
-
-    /* Add source MAC from ethernet header */
-    if (skb->len >= ETH_HLEN) {
-        struct ethhdr *eth = (struct ethhdr *)skb->data;
-        if (nla_put(nlskb, QDHCP_ATTR_MAC_SRC, ETH_ALEN, eth->h_source))
-            goto nla_fail;
-        if (nla_put(nlskb, QDHCP_ATTR_MAC_DST, ETH_ALEN, eth->h_dest))
-            goto nla_fail;
-    }
-
-    genlmsg_end(nlskb, hdr);
-
-    /* Send to daemon */
-    return genlmsg_unicast(dev_net(dev), nlskb, priv->daemon_portid);
-
-nla_fail:
-    genlmsg_cancel(nlskb, hdr);
-    nlmsg_free(nlskb);
-    return -EMSGSIZE;
+    return jhash(mac, ETH_ALEN, 0);
 }
+
+/*
+ * Binding Table Functions
+ */
+static struct binding_entry *binding_find(struct qdhcp_priv *priv, const u8 *mac)
+{
+    struct binding_entry *entry;
+    u32 h = mac_hash(mac);
+
+    hash_for_each_possible(priv->bindings, entry, hash_node, h) {
+        if (ether_addr_equal(entry->mac, mac))
+            return entry;
+    }
+    return NULL;
+}
+
+static int binding_add(struct qdhcp_priv *priv, const u8 *mac, __be32 ip,
+                       int ifindex, u32 lease_time)
+{
+    struct binding_entry *entry;
+    unsigned long flags;
+
+    spin_lock_irqsave(&priv->bind_lock, flags);
+
+    entry = binding_find(priv, mac);
+    if (entry) {
+        entry->ip = ip;
+        entry->ifindex = ifindex;
+        entry->lease_time = lease_time;
+        entry->expire_time_ns = ktime_get_ns() + (u64)lease_time * NSEC_PER_SEC;
+        spin_unlock_irqrestore(&priv->bind_lock, flags);
+        return 0;
+    }
+
+    entry = kzalloc(sizeof(*entry), GFP_ATOMIC);
+    if (!entry) {
+        spin_unlock_irqrestore(&priv->bind_lock, flags);
+        return -ENOMEM;
+    }
+
+    memcpy(entry->mac, mac, ETH_ALEN);
+    entry->ip = ip;
+    entry->ifindex = ifindex;
+    entry->lease_time = lease_time;
+    entry->expire_time_ns = ktime_get_ns() + (u64)lease_time * NSEC_PER_SEC;
+
+    hash_add(priv->bindings, &entry->hash_node, mac_hash(mac));
+    priv->bind_count++;
+
+    spin_unlock_irqrestore(&priv->bind_lock, flags);
+    return 0;
+}
+
+static int binding_del(struct qdhcp_priv *priv, const u8 *mac)
+{
+    struct binding_entry *entry;
+    unsigned long flags;
+
+    spin_lock_irqsave(&priv->bind_lock, flags);
+
+    entry = binding_find(priv, mac);
+    if (!entry) {
+        spin_unlock_irqrestore(&priv->bind_lock, flags);
+        return -ENOENT;
+    }
+
+    hash_del(&entry->hash_node);
+    priv->bind_count--;
+
+    spin_unlock_irqrestore(&priv->bind_lock, flags);
+
+    kfree(entry);
+    return 0;
+}
+
+static void binding_clear_all(struct qdhcp_priv *priv)
+{
+    struct binding_entry *entry;
+    struct hlist_node *tmp;
+    unsigned long flags;
+    int bkt;
+
+    spin_lock_irqsave(&priv->bind_lock, flags);
+
+    hash_for_each_safe(priv->bindings, bkt, tmp, entry, hash_node) {
+        hash_del(&entry->hash_node);
+        kfree(entry);
+    }
+    priv->bind_count = 0;
+
+    spin_unlock_irqrestore(&priv->bind_lock, flags);
+}
+
+/*
+ * Interface Management
+ */
+static struct monitored_iface *iface_find(struct qdhcp_priv *priv, int ifindex)
+{
+    int i;
+    for (i = 0; i < priv->iface_count; i++) {
+        if (priv->ifaces[i].ifindex == ifindex && priv->ifaces[i].active)
+            return &priv->ifaces[i];
+    }
+    return NULL;
+}
+
+static bool iface_is_monitored(struct qdhcp_priv *priv, int ifindex)
+{
+    if (priv->iface_count == 0)
+        return true;  /* Monitor all if none configured */
+    return iface_find(priv, ifindex) != NULL;
+}
+
+static bool iface_is_trusted(struct qdhcp_priv *priv, int ifindex)
+{
+    struct monitored_iface *iface = iface_find(priv, ifindex);
+    return iface ? iface->trusted : false;
+}
+
+static int iface_add(struct qdhcp_priv *priv, int ifindex, const char *name)
+{
+    unsigned long flags;
+    int i;
+
+    spin_lock_irqsave(&priv->iface_lock, flags);
+
+    for (i = 0; i < priv->iface_count; i++) {
+        if (priv->ifaces[i].ifindex == ifindex) {
+            priv->ifaces[i].active = true;
+            spin_unlock_irqrestore(&priv->iface_lock, flags);
+            return 0;
+        }
+    }
+
+    if (priv->iface_count >= MAX_INTERFACES) {
+        spin_unlock_irqrestore(&priv->iface_lock, flags);
+        return -ENOSPC;
+    }
+
+    priv->ifaces[priv->iface_count].ifindex = ifindex;
+    strscpy(priv->ifaces[priv->iface_count].ifname, name, IFNAMSIZ);
+    priv->ifaces[priv->iface_count].trusted = false;
+    priv->ifaces[priv->iface_count].active = true;
+    priv->iface_count++;
+
+    spin_unlock_irqrestore(&priv->iface_lock, flags);
+
+    pr_info("qdhcp: added interface %s (ifindex=%d)\n", name, ifindex);
+    return 0;
+}
+
+static int iface_del(struct qdhcp_priv *priv, int ifindex)
+{
+    struct monitored_iface *iface;
+    unsigned long flags;
+
+    spin_lock_irqsave(&priv->iface_lock, flags);
+
+    iface = iface_find(priv, ifindex);
+    if (!iface) {
+        spin_unlock_irqrestore(&priv->iface_lock, flags);
+        return -ENOENT;
+    }
+
+    iface->active = false;
+
+    spin_unlock_irqrestore(&priv->iface_lock, flags);
+    return 0;
+}
+
+/*
+ * DHCP Message Type Extraction
+ */
+static u8 get_dhcp_msg_type(const u8 *dhcp_data, int len)
+{
+    const u8 *opts;
+    int opts_len, i;
+
+    if (len < 240)
+        return 0;
+
+    /* Verify DHCP magic cookie: 99.130.83.99 */
+    if (dhcp_data[236] != 99 || dhcp_data[237] != 130 ||
+        dhcp_data[238] != 83 || dhcp_data[239] != 99)
+        return 0;
+
+    opts = dhcp_data + 240;
+    opts_len = len - 240;
+
+    for (i = 0; i < opts_len; ) {
+        u8 opt = opts[i];
+        u8 opt_len;
+
+        if (opt == 255) break;
+        if (opt == 0) { i++; continue; }
+        if (i + 1 >= opts_len) break;
+
+        opt_len = opts[i + 1];
+        if (i + 2 + opt_len > opts_len) break;
+
+        if (opt == 53 && opt_len >= 1)
+            return opts[i + 2];
+
+        i += 2 + opt_len;
+    }
+
+    return 0;
+}
+
+static void update_dhcp_stats(struct qdhcp_priv *priv, u8 msg_type)
+{
+    switch (msg_type) {
+    case DHCP_TYPE_DISCOVER: priv->stats.dhcp_discover++; break;
+    case DHCP_TYPE_OFFER:    priv->stats.dhcp_offer++; break;
+    case DHCP_TYPE_REQUEST:  priv->stats.dhcp_request++; break;
+    case DHCP_TYPE_ACK:      priv->stats.dhcp_ack++; break;
+    case DHCP_TYPE_NAK:      priv->stats.dhcp_nak++; break;
+    case DHCP_TYPE_RELEASE:  priv->stats.dhcp_release++; break;
+    case DHCP_TYPE_DECLINE:  priv->stats.dhcp_decline++; break;
+    }
+}
+
+/*
+ * Check if packet is DHCP (UDP port 67 or 68)
+ */
+static bool is_dhcp_packet(struct sk_buff *skb, u16 *sport, u16 *dport)
+{
+    struct iphdr *iph;
+    struct udphdr *udph;
+    int ip_hdr_len;
+
+    if (!pskb_may_pull(skb, sizeof(struct iphdr)))
+        return false;
+
+    iph = ip_hdr(skb);
+    if (iph->protocol != IPPROTO_UDP)
+        return false;
+
+    ip_hdr_len = iph->ihl * 4;
+    if (!pskb_may_pull(skb, ip_hdr_len + sizeof(struct udphdr)))
+        return false;
+
+    udph = (struct udphdr *)((u8 *)iph + ip_hdr_len);
+    *sport = ntohs(udph->source);
+    *dport = ntohs(udph->dest);
+
+    return (*sport == DHCP_SERVER_PORT || *sport == DHCP_CLIENT_PORT ||
+            *dport == DHCP_SERVER_PORT || *dport == DHCP_CLIENT_PORT);
+}
+
+/*
+ * Forward DHCP packet to userspace via qdhcp0
+ * Prepends metadata header to the original ethernet frame
+ */
+static int forward_to_userspace(struct qdhcp_priv *priv, struct sk_buff *orig_skb,
+                                int src_ifindex, u8 method)
+{
+    struct sk_buff *skb;
+    struct qdhcp_meta_hdr *meta;
+    struct ethhdr *orig_eth;
+    struct iphdr *iph;
+    struct udphdr *udph;
+    const u8 *dhcp_data;
+    int dhcp_len, eth_len, total_len;
+    u8 msg_type;
+
+    /* Get ethernet header */
+    if (!skb_mac_header_was_set(orig_skb)) {
+        priv->stats.rx_dropped++;
+        return -EINVAL;
+    }
+
+    orig_eth = eth_hdr(orig_skb);
+    eth_len = orig_skb->len + (orig_skb->data - skb_mac_header(orig_skb));
+
+    /* Get DHCP payload for message type */
+    iph = ip_hdr(orig_skb);
+    udph = (struct udphdr *)((u8 *)iph + iph->ihl * 4);
+    dhcp_data = (u8 *)udph + sizeof(struct udphdr);
+    dhcp_len = ntohs(udph->len) - sizeof(struct udphdr);
+
+    msg_type = get_dhcp_msg_type(dhcp_data, dhcp_len);
+    update_dhcp_stats(priv, msg_type);
+
+    /* Allocate skb: metadata + original ethernet frame */
+    total_len = QDHCP_META_HDR_SIZE + eth_len;
+    skb = netdev_alloc_skb(priv->netdev, total_len + NET_IP_ALIGN);
+    if (!skb) {
+        priv->stats.rx_dropped++;
+        return -ENOMEM;
+    }
+
+    skb_reserve(skb, NET_IP_ALIGN);
+
+    /* Build metadata header */
+    meta = skb_put(skb, QDHCP_META_HDR_SIZE);
+    memset(meta, 0, QDHCP_META_HDR_SIZE);
+    meta->magic = QDHCP_META_MAGIC;
+    meta->version = QDHCP_META_VERSION;
+    meta->direction = QDHCP_DIR_RX;
+    meta->msg_type = msg_type;
+    meta->ifindex = src_ifindex;
+    meta->pkt_len = eth_len;
+    meta->trusted = iface_is_trusted(priv, src_ifindex) ? 1 : 0;
+    meta->method = method;
+    memcpy(meta->src_mac, orig_eth->h_source, ETH_ALEN);
+    memcpy(meta->dst_mac, orig_eth->h_dest, ETH_ALEN);
+
+    if (skb_vlan_tag_present(orig_skb))
+        meta->vlan_id = skb_vlan_tag_get(orig_skb);
+
+    /* Copy original ethernet frame */
+    skb_put_data(skb, skb_mac_header(orig_skb), eth_len);
+
+    /* Set up skb for qdhcp0 */
+    skb_reset_mac_header(skb);
+    skb->protocol = htons(ETH_P_IP);
+    skb->dev = priv->netdev;
+    skb->ip_summed = CHECKSUM_UNNECESSARY;
+
+    /* Inject into qdhcp0 - userspace reads via raw socket */
+    netif_rx(skb);
+
+    priv->stats.rx_packets++;
+    priv->stats.rx_bytes += total_len;
+
+    pr_debug("qdhcp: RX ifindex=%d type=%u len=%d method=%u\n",
+             src_ifindex, msg_type, eth_len, method);
+
+    return 0;
+}
+
+/*
+ * Method 1: dev_add_pack() Protocol Handler
+ */
+static int ptype_handler(struct sk_buff *skb, struct net_device *dev,
+                         struct packet_type *pt, struct net_device *orig_dev)
+{
+    struct qdhcp_priv *priv;
+    u16 sport, dport;
+
+    if (!qdhcp_netdev)
+        goto pass;
+
+    priv = netdev_priv(qdhcp_netdev);
+
+    if (!(priv->method & QDHCP_METHOD_DEV_ADD_PACK))
+        goto pass;
+
+    /* Don't intercept from qdhcp0 itself */
+    if (orig_dev == qdhcp_netdev)
+        goto pass;
+
+    if (!iface_is_monitored(priv, orig_dev->ifindex))
+        goto pass;
+
+    if (!is_dhcp_packet(skb, &sport, &dport))
+        goto pass;
+
+    priv->stats.dev_pack_intercepts++;
+    forward_to_userspace(priv, skb, orig_dev->ifindex, QDHCP_METHOD_DEV_ADD_PACK);
+
+pass:
+    kfree_skb(skb);
+    return NET_RX_SUCCESS;
+}
+
+/*
+ * Method 2: TC Ingress Classifier
+ */
+static int tc_classify(struct sk_buff *skb, const struct tcf_proto *tp,
+                       struct tcf_result *res)
+{
+    struct qdhcp_priv *priv;
+    u16 sport = 0, dport = 0;
+
+    if (!qdhcp_netdev)
+        return TC_ACT_OK;
+
+    priv = netdev_priv(qdhcp_netdev);
+
+    if (!(priv->method & QDHCP_METHOD_TC_INGRESS))
+        return TC_ACT_OK;
+
+    if (skb->protocol != htons(ETH_P_IP))
+        return TC_ACT_OK;
+
+    if (skb->dev == qdhcp_netdev)
+        return TC_ACT_OK;
+
+    if (!iface_is_monitored(priv, skb->dev->ifindex))
+        return TC_ACT_OK;
+
+    if (!pskb_may_pull(skb, sizeof(struct iphdr)))
+        return TC_ACT_OK;
+
+    skb_reset_network_header(skb);
+
+    if (!is_dhcp_packet(skb, &sport, &dport))
+        return TC_ACT_OK;
+
+    priv->stats.tc_intercepts++;
+    forward_to_userspace(priv, skb, skb->dev->ifindex, QDHCP_METHOD_TC_INGRESS);
+
+    return TC_ACT_OK;
+}
+
+static int tc_init(struct tcf_proto *tp)
+{
+    return 0;
+}
+
+static void tc_destroy(struct tcf_proto *tp, bool rtnl_held,
+                       struct netlink_ext_ack *extack)
+{
+}
+
+static struct tcf_proto_ops qdhcp_tc_ops __read_mostly = {
+    .kind       = "qdhcp",
+    .classify   = tc_classify,
+    .init       = tc_init,
+    .destroy    = tc_destroy,
+    .owner      = THIS_MODULE,
+};
 
 /*
  * Network device operations
  */
-
 static int qdhcp_dev_open(struct net_device *dev)
 {
     netif_start_queue(dev);
@@ -174,25 +554,84 @@ static int qdhcp_dev_stop(struct net_device *dev)
     return 0;
 }
 
+/*
+ * TX from userspace: parse metadata header and forward to physical interface
+ */
 static netdev_tx_t qdhcp_dev_xmit(struct sk_buff *skb, struct net_device *dev)
 {
     struct qdhcp_priv *priv = netdev_priv(dev);
-    int ret;
+    struct qdhcp_meta_hdr *meta;
+    struct net_device *out_dev;
+    struct sk_buff *nskb;
+    int pkt_offset;
 
-    spin_lock(&priv->lock);
-    priv->stats.tx_packets++;
-    priv->stats.tx_bytes += skb->len;
-    spin_unlock(&priv->lock);
+    /* Validate minimum length */
+    if (skb->len < QDHCP_META_HDR_SIZE) {
+        pr_debug("qdhcp: TX skb too short (%d)\n", skb->len);
+        goto drop;
+    }
 
-    /* Forward to userspace */
-    ret = qdhcp_forward_to_user(dev, skb);
-    if (ret < 0) {
+    /* Get metadata header */
+    meta = (struct qdhcp_meta_hdr *)skb->data;
+
+    /* Validate magic */
+    if (meta->magic != QDHCP_META_MAGIC) {
+        pr_debug("qdhcp: TX invalid magic 0x%08x\n", meta->magic);
+        goto drop;
+    }
+
+    /* Get target interface */
+    out_dev = dev_get_by_index(&init_net, meta->ifindex);
+    if (!out_dev) {
+        pr_debug("qdhcp: TX target ifindex %d not found\n", meta->ifindex);
+        goto drop;
+    }
+
+    /* Skip metadata, get packet */
+    pkt_offset = QDHCP_META_HDR_SIZE;
+    if (skb->len < pkt_offset + meta->pkt_len) {
+        pr_debug("qdhcp: TX packet length mismatch\n");
+        dev_put(out_dev);
+        goto drop;
+    }
+
+    /* Allocate new skb for the actual packet */
+    nskb = netdev_alloc_skb(out_dev, meta->pkt_len + NET_IP_ALIGN);
+    if (!nskb) {
+        dev_put(out_dev);
+        goto drop;
+    }
+
+    skb_reserve(nskb, NET_IP_ALIGN);
+    skb_put_data(nskb, skb->data + pkt_offset, meta->pkt_len);
+
+    /* Set up for transmission */
+    nskb->dev = out_dev;
+    skb_reset_mac_header(nskb);
+    nskb->protocol = eth_type_trans(nskb, out_dev);
+
+    pr_debug("qdhcp: TX ifindex=%d len=%d\n", meta->ifindex, meta->pkt_len);
+
+    /* Send via dev_queue_xmit - bypasses routing */
+    if (dev_queue_xmit(nskb) != NET_XMIT_SUCCESS) {
         spin_lock(&priv->lock);
         priv->stats.tx_dropped++;
         spin_unlock(&priv->lock);
+    } else {
+        spin_lock(&priv->lock);
+        priv->stats.tx_packets++;
+        priv->stats.tx_bytes += meta->pkt_len;
+        spin_unlock(&priv->lock);
     }
 
-    /* Free the skb - we've copied the data */
+    dev_put(out_dev);
+    dev_kfree_skb(skb);
+    return NETDEV_TX_OK;
+
+drop:
+    spin_lock(&priv->lock);
+    priv->stats.tx_dropped++;
+    spin_unlock(&priv->lock);
     dev_kfree_skb(skb);
     return NETDEV_TX_OK;
 }
@@ -214,7 +653,7 @@ static void qdhcp_dev_get_stats64(struct net_device *dev,
 
 static int qdhcp_dev_change_mtu(struct net_device *dev, int new_mtu)
 {
-    if (new_mtu < 68 || new_mtu > 1500)
+    if (new_mtu < 68 || new_mtu > 9000)
         return -EINVAL;
     dev->mtu = new_mtu;
     return 0;
@@ -231,22 +670,31 @@ static const struct net_device_ops qdhcp_netdev_ops = {
 static void qdhcp_dev_setup(struct net_device *dev)
 {
     ether_setup(dev);
-
     dev->netdev_ops = &qdhcp_netdev_ops;
     dev->needs_free_netdev = true;
-
-    /* Generate random MAC */
     eth_hw_addr_random(dev);
-
-    /* Set flags */
     dev->flags |= IFF_NOARP;
     dev->features |= NETIF_F_HW_CSUM;
+    dev->mtu = 1500 + QDHCP_META_HDR_SIZE;  /* Allow metadata + full frame */
 }
+
+/*
+ * Netlink attribute policy
+ */
+static struct nla_policy qdhcp_genl_policy[__QDHCP_ATTR_MAX] = {
+    [QDHCP_ATTR_IFINDEX]    = { .type = NLA_S32 },
+    [QDHCP_ATTR_IFNAME]     = { .type = NLA_NUL_STRING, .len = IFNAMSIZ },
+    [QDHCP_ATTR_MAC]        = { .type = NLA_BINARY, .len = ETH_ALEN },
+    [QDHCP_ATTR_IP]         = { .type = NLA_U32 },
+    [QDHCP_ATTR_TRUSTED]    = { .type = NLA_U8 },
+    [QDHCP_ATTR_LEASE_TIME] = { .type = NLA_U32 },
+    [QDHCP_ATTR_METHOD]     = { .type = NLA_U8 },
+    [QDHCP_ATTR_STATS]      = { .type = NLA_BINARY },
+};
 
 /*
  * Netlink command handlers
  */
-
 static int qdhcp_cmd_register(struct sk_buff *skb, struct genl_info *info)
 {
     struct qdhcp_priv *priv;
@@ -255,14 +703,11 @@ static int qdhcp_cmd_register(struct sk_buff *skb, struct genl_info *info)
         return -ENODEV;
 
     priv = netdev_priv(qdhcp_netdev);
-
     spin_lock(&priv->lock);
-    priv->daemon_pid = info->snd_portid;
-    priv->daemon_portid = info->snd_portid;
     priv->daemon_registered = true;
     spin_unlock(&priv->lock);
 
-    pr_info("qdhcp: daemon registered (portid=%u)\n", info->snd_portid);
+    pr_info("qdhcp: daemon registered\n");
     return 0;
 }
 
@@ -274,56 +719,126 @@ static int qdhcp_cmd_unregister(struct sk_buff *skb, struct genl_info *info)
         return -ENODEV;
 
     priv = netdev_priv(qdhcp_netdev);
-
     spin_lock(&priv->lock);
     priv->daemon_registered = false;
-    priv->daemon_portid = 0;
-    priv->daemon_pid = 0;
     spin_unlock(&priv->lock);
 
     pr_info("qdhcp: daemon unregistered\n");
     return 0;
 }
 
-/* Handle packet from userspace to inject into network */
-static int qdhcp_cmd_packet_down(struct sk_buff *skb, struct genl_info *info)
+static int qdhcp_cmd_add_interface(struct sk_buff *skb, struct genl_info *info)
 {
     struct qdhcp_priv *priv;
-    struct sk_buff *txskb;
-    void *pkt_data;
-    int pkt_len;
+    int ifindex;
+    const char *ifname = "";
+
+    if (!qdhcp_netdev || !info->attrs[QDHCP_ATTR_IFINDEX])
+        return -EINVAL;
+
+    priv = netdev_priv(qdhcp_netdev);
+    ifindex = nla_get_s32(info->attrs[QDHCP_ATTR_IFINDEX]);
+
+    if (info->attrs[QDHCP_ATTR_IFNAME])
+        ifname = nla_data(info->attrs[QDHCP_ATTR_IFNAME]);
+
+    return iface_add(priv, ifindex, ifname);
+}
+
+static int qdhcp_cmd_del_interface(struct sk_buff *skb, struct genl_info *info)
+{
+    struct qdhcp_priv *priv;
+
+    if (!qdhcp_netdev || !info->attrs[QDHCP_ATTR_IFINDEX])
+        return -EINVAL;
+
+    priv = netdev_priv(qdhcp_netdev);
+    return iface_del(priv, nla_get_s32(info->attrs[QDHCP_ATTR_IFINDEX]));
+}
+
+static int qdhcp_cmd_set_trusted(struct sk_buff *skb, struct genl_info *info)
+{
+    struct qdhcp_priv *priv;
+    struct monitored_iface *iface;
+    int ifindex;
+    unsigned long flags;
+
+    if (!qdhcp_netdev || !info->attrs[QDHCP_ATTR_IFINDEX] ||
+        !info->attrs[QDHCP_ATTR_TRUSTED])
+        return -EINVAL;
+
+    priv = netdev_priv(qdhcp_netdev);
+    ifindex = nla_get_s32(info->attrs[QDHCP_ATTR_IFINDEX]);
+
+    spin_lock_irqsave(&priv->iface_lock, flags);
+    iface = iface_find(priv, ifindex);
+    if (!iface) {
+        spin_unlock_irqrestore(&priv->iface_lock, flags);
+        return -ENOENT;
+    }
+    iface->trusted = nla_get_u8(info->attrs[QDHCP_ATTR_TRUSTED]) ? true : false;
+    spin_unlock_irqrestore(&priv->iface_lock, flags);
+
+    return 0;
+}
+
+static int qdhcp_cmd_add_binding(struct sk_buff *skb, struct genl_info *info)
+{
+    struct qdhcp_priv *priv;
+    int ifindex = 0;
+    u32 lease_time = 3600;
+
+    if (!qdhcp_netdev || !info->attrs[QDHCP_ATTR_MAC] ||
+        !info->attrs[QDHCP_ATTR_IP])
+        return -EINVAL;
+
+    priv = netdev_priv(qdhcp_netdev);
+
+    if (info->attrs[QDHCP_ATTR_IFINDEX])
+        ifindex = nla_get_s32(info->attrs[QDHCP_ATTR_IFINDEX]);
+    if (info->attrs[QDHCP_ATTR_LEASE_TIME])
+        lease_time = nla_get_u32(info->attrs[QDHCP_ATTR_LEASE_TIME]);
+
+    return binding_add(priv,
+                       nla_data(info->attrs[QDHCP_ATTR_MAC]),
+                       htonl(nla_get_u32(info->attrs[QDHCP_ATTR_IP])),
+                       ifindex, lease_time);
+}
+
+static int qdhcp_cmd_del_binding(struct sk_buff *skb, struct genl_info *info)
+{
+    struct qdhcp_priv *priv;
+
+    if (!qdhcp_netdev || !info->attrs[QDHCP_ATTR_MAC])
+        return -EINVAL;
+
+    priv = netdev_priv(qdhcp_netdev);
+    return binding_del(priv, nla_data(info->attrs[QDHCP_ATTR_MAC]));
+}
+
+static int qdhcp_cmd_clear_bindings(struct sk_buff *skb, struct genl_info *info)
+{
+    struct qdhcp_priv *priv;
 
     if (!qdhcp_netdev)
         return -ENODEV;
 
-    if (!info->attrs[QDHCP_ATTR_PACKET])
+    priv = netdev_priv(qdhcp_netdev);
+    binding_clear_all(priv);
+    return 0;
+}
+
+static int qdhcp_cmd_set_method(struct sk_buff *skb, struct genl_info *info)
+{
+    struct qdhcp_priv *priv;
+
+    if (!qdhcp_netdev || !info->attrs[QDHCP_ATTR_METHOD])
         return -EINVAL;
 
     priv = netdev_priv(qdhcp_netdev);
-    pkt_data = nla_data(info->attrs[QDHCP_ATTR_PACKET]);
-    pkt_len = nla_len(info->attrs[QDHCP_ATTR_PACKET]);
+    priv->method = nla_get_u8(info->attrs[QDHCP_ATTR_METHOD]);
 
-    /* Allocate skb and copy packet data */
-    txskb = netdev_alloc_skb(qdhcp_netdev, pkt_len + NET_IP_ALIGN);
-    if (!txskb)
-        return -ENOMEM;
-
-    skb_reserve(txskb, NET_IP_ALIGN);
-    skb_put_data(txskb, pkt_data, pkt_len);
-
-    /* Set up for reception */
-    txskb->dev = qdhcp_netdev;
-    txskb->protocol = eth_type_trans(txskb, qdhcp_netdev);
-    txskb->ip_summed = CHECKSUM_UNNECESSARY;
-
-    spin_lock(&priv->lock);
-    priv->stats.rx_packets++;
-    priv->stats.rx_bytes += pkt_len;
-    spin_unlock(&priv->lock);
-
-    /* Hand to network stack */
-    netif_rx(txskb);
-
+    pr_info("qdhcp: method set to 0x%02x\n", priv->method);
     return 0;
 }
 
@@ -331,8 +846,8 @@ static int qdhcp_cmd_get_stats(struct sk_buff *skb, struct genl_info *info)
 {
     struct qdhcp_priv *priv;
     struct sk_buff *reply;
-    void *hdr;
     struct qdhcp_stats stats;
+    void *hdr;
 
     if (!qdhcp_netdev)
         return -ENODEV;
@@ -352,6 +867,7 @@ static int qdhcp_cmd_get_stats(struct sk_buff *skb, struct genl_info *info)
 
     spin_lock(&priv->lock);
     memcpy(&stats, &priv->stats, sizeof(stats));
+    stats.binding_count = priv->bind_count;
     spin_unlock(&priv->lock);
 
     if (nla_put(reply, QDHCP_ATTR_STATS, sizeof(stats), &stats)) {
@@ -366,95 +882,108 @@ static int qdhcp_cmd_get_stats(struct sk_buff *skb, struct genl_info *info)
 
 /* Netlink operations */
 static const struct genl_ops qdhcp_genl_ops[] = {
-    {
-        .cmd = QDHCP_CMD_REGISTER,
-        .flags = 0,
-        .policy = qdhcp_genl_policy,
-        .doit = qdhcp_cmd_register,
-    },
-    {
-        .cmd = QDHCP_CMD_UNREGISTER,
-        .flags = 0,
-        .policy = qdhcp_genl_policy,
-        .doit = qdhcp_cmd_unregister,
-    },
-    {
-        .cmd = QDHCP_CMD_PACKET_DOWN,
-        .flags = 0,
-        .policy = qdhcp_genl_policy,
-        .doit = qdhcp_cmd_packet_down,
-    },
-    {
-        .cmd = QDHCP_CMD_GET_STATS,
-        .flags = 0,
-        .policy = qdhcp_genl_policy,
-        .doit = qdhcp_cmd_get_stats,
-    },
+    { .cmd = QDHCP_CMD_REGISTER,       .doit = qdhcp_cmd_register,       .policy = qdhcp_genl_policy },
+    { .cmd = QDHCP_CMD_UNREGISTER,     .doit = qdhcp_cmd_unregister,     .policy = qdhcp_genl_policy },
+    { .cmd = QDHCP_CMD_ADD_INTERFACE,  .doit = qdhcp_cmd_add_interface,  .policy = qdhcp_genl_policy },
+    { .cmd = QDHCP_CMD_DEL_INTERFACE,  .doit = qdhcp_cmd_del_interface,  .policy = qdhcp_genl_policy },
+    { .cmd = QDHCP_CMD_SET_TRUSTED,    .doit = qdhcp_cmd_set_trusted,    .policy = qdhcp_genl_policy },
+    { .cmd = QDHCP_CMD_ADD_BINDING,    .doit = qdhcp_cmd_add_binding,    .policy = qdhcp_genl_policy },
+    { .cmd = QDHCP_CMD_DEL_BINDING,    .doit = qdhcp_cmd_del_binding,    .policy = qdhcp_genl_policy },
+    { .cmd = QDHCP_CMD_CLEAR_BINDINGS, .doit = qdhcp_cmd_clear_bindings, .policy = qdhcp_genl_policy },
+    { .cmd = QDHCP_CMD_SET_METHOD,     .doit = qdhcp_cmd_set_method,     .policy = qdhcp_genl_policy },
+    { .cmd = QDHCP_CMD_GET_STATS,      .doit = qdhcp_cmd_get_stats,      .policy = qdhcp_genl_policy },
 };
 
-/* Generic netlink family */
 static struct genl_family qdhcp_genl_family = {
-    .name = QDHCP_GENL_NAME,
-    .version = QDHCP_GENL_VERSION,
-    .maxattr = QDHCP_ATTR_MAX,
-    .ops = qdhcp_genl_ops,
-    .n_ops = ARRAY_SIZE(qdhcp_genl_ops),
-    .mcgrps = qdhcp_genl_mcgrps,
-    .n_mcgrps = ARRAY_SIZE(qdhcp_genl_mcgrps),
-    .module = THIS_MODULE,
+    .name       = QDHCP_GENL_NAME,
+    .version    = QDHCP_GENL_VERSION,
+    .maxattr    = __QDHCP_ATTR_MAX - 1,
+    .ops        = qdhcp_genl_ops,
+    .n_ops      = ARRAY_SIZE(qdhcp_genl_ops),
+    .module     = THIS_MODULE,
 };
 
 /*
  * Module init/exit
  */
-
 static int __init qdhcp_init(void)
 {
     struct qdhcp_priv *priv;
     int ret;
 
+    pr_info("qdhcp: loading (method=0x%02x)\n", intercept_method);
+
     /* Create network device */
     qdhcp_netdev = alloc_netdev(sizeof(struct qdhcp_priv),
                                  QDHCP_DEV_NAME, NET_NAME_UNKNOWN,
                                  qdhcp_dev_setup);
-    if (!qdhcp_netdev) {
-        pr_err("qdhcp: failed to allocate netdev\n");
+    if (!qdhcp_netdev)
         return -ENOMEM;
-    }
 
     priv = netdev_priv(qdhcp_netdev);
     priv->netdev = qdhcp_netdev;
     spin_lock_init(&priv->lock);
+    spin_lock_init(&priv->bind_lock);
+    spin_lock_init(&priv->iface_lock);
+    hash_init(priv->bindings);
+    priv->method = intercept_method;
 
-    /* Register network device */
     ret = register_netdev(qdhcp_netdev);
     if (ret) {
-        pr_err("qdhcp: failed to register netdev: %d\n", ret);
+        pr_err("qdhcp: register_netdev failed: %d\n", ret);
         free_netdev(qdhcp_netdev);
         return ret;
     }
 
-    /* Register netlink family */
     ret = genl_register_family(&qdhcp_genl_family);
     if (ret) {
-        pr_err("qdhcp: failed to register netlink family: %d\n", ret);
+        pr_err("qdhcp: genl_register_family failed: %d\n", ret);
         unregister_netdev(qdhcp_netdev);
         return ret;
     }
 
-    pr_info("qdhcp: module loaded, device %s created\n", QDHCP_DEV_NAME);
+    /* Register protocol handler (Method 1) */
+    if (intercept_method & QDHCP_METHOD_DEV_ADD_PACK) {
+        qdhcp_ptype.type = htons(ETH_P_IP);
+        qdhcp_ptype.func = ptype_handler;
+        qdhcp_ptype.dev = NULL;
+        dev_add_pack(&qdhcp_ptype);
+        ptype_registered = true;
+        pr_info("qdhcp: dev_add_pack registered\n");
+    }
+
+    /* Register TC classifier (Method 2) */
+    if (intercept_method & QDHCP_METHOD_TC_INGRESS) {
+        ret = register_tcf_proto_ops(&qdhcp_tc_ops);
+        if (ret < 0)
+            pr_warn("qdhcp: TC classifier failed: %d\n", ret);
+        else
+            pr_info("qdhcp: TC classifier registered\n");
+    }
+
+    pr_info("qdhcp: loaded, device %s created\n", QDHCP_DEV_NAME);
     return 0;
 }
 
 static void __exit qdhcp_exit(void)
 {
+    struct qdhcp_priv *priv;
+
+    if (intercept_method & QDHCP_METHOD_TC_INGRESS)
+        unregister_tcf_proto_ops(&qdhcp_tc_ops);
+
+    if (ptype_registered)
+        dev_remove_pack(&qdhcp_ptype);
+
     genl_unregister_family(&qdhcp_genl_family);
 
     if (qdhcp_netdev) {
+        priv = netdev_priv(qdhcp_netdev);
+        binding_clear_all(priv);
         unregister_netdev(qdhcp_netdev);
     }
 
-    pr_info("qdhcp: module unloaded\n");
+    pr_info("qdhcp: unloaded\n");
 }
 
 module_init(qdhcp_init);

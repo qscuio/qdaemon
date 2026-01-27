@@ -1,0 +1,31 @@
+#!/bin/sh
+set -e
+
+PACKAGE_NAME="qd-dhcp-kmod"
+PACKAGE_VERSION="1.0.0"
+
+case "$1" in
+    remove|upgrade|deconfigure)
+        # Unload module if loaded
+        if lsmod | grep -q "^qd_dhcp_kmod"; then
+            rmmod qd_dhcp_kmod || true
+        fi
+
+        # Remove from DKMS
+        if [ -x /usr/sbin/dkms ]; then
+            dkms remove -m ${PACKAGE_NAME} -v ${PACKAGE_VERSION} --all || true
+        fi
+        ;;
+
+    failed-upgrade)
+        ;;
+
+    *)
+        echo "prerm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

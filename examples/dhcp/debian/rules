@@ -1,0 +1,53 @@
+#!/usr/bin/make -f
+
+# Uncomment for verbose build
+#export DH_VERBOSE = 1
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+
+%:
+	dh $@
+
+override_dh_auto_build:
+	# Build userspace components only (kernel module via DKMS)
+	$(MAKE) CC=gcc STANDALONE=1 EXTRA_CFLAGS="$(CFLAGS)" \
+		EXTRA_LDFLAGS="$(LDFLAGS)" all
+
+override_dh_auto_install:
+	# Install userspace binaries
+	install -d $(CURDIR)/debian/qd-dhcpd/usr/sbin
+	install -m 755 qd_dhcpd $(CURDIR)/debian/qd-dhcpd/usr/sbin/
+	install -d $(CURDIR)/debian/qd-dhcpd/usr/bin
+	install -m 755 qd_dhcp_cli $(CURDIR)/debian/qd-dhcpd/usr/bin/
+
+	# Install configuration
+	install -d $(CURDIR)/debian/qd-dhcpd/etc/qd-dhcpd
+	install -m 644 etc/qd-dhcpd/qd-dhcpd.conf $(CURDIR)/debian/qd-dhcpd/etc/qd-dhcpd/
+	install -d $(CURDIR)/debian/qd-dhcpd/etc/default
+	install -m 644 etc/default/qd-dhcpd $(CURDIR)/debian/qd-dhcpd/etc/default/
+
+	# Install systemd service
+	install -d $(CURDIR)/debian/qd-dhcpd/lib/systemd/system
+	install -m 644 debian/qd-dhcpd.service $(CURDIR)/debian/qd-dhcpd/lib/systemd/system/
+
+	# Install headers for DKMS
+	install -d $(CURDIR)/debian/qd-dhcpd/usr/include/qd-dhcpd
+	install -m 644 include/dhcp_kmod.h $(CURDIR)/debian/qd-dhcpd/usr/include/qd-dhcpd/
+
+	# Create lease directory
+	install -d $(CURDIR)/debian/qd-dhcpd/var/lib/qd-dhcpd
+
+	# Install DKMS source
+	install -d $(CURDIR)/debian/qd-dhcpd-dkms/usr/src/qd-dhcp-kmod-1.0.0
+	install -m 644 kernel/qd_dhcp_kmod.c $(CURDIR)/debian/qd-dhcpd-dkms/usr/src/qd-dhcp-kmod-1.0.0/
+	install -m 644 include/dhcp_kmod.h $(CURDIR)/debian/qd-dhcpd-dkms/usr/src/qd-dhcp-kmod-1.0.0/
+	install -m 644 kernel/Makefile.dkms $(CURDIR)/debian/qd-dhcpd-dkms/usr/src/qd-dhcp-kmod-1.0.0/Makefile
+	install -m 644 debian/dkms.conf $(CURDIR)/debian/qd-dhcpd-dkms/usr/src/qd-dhcp-kmod-1.0.0/dkms.conf
+
+override_dh_auto_clean:
+	$(MAKE) clean || true
+	rm -f test_rawsock
+
+override_dh_auto_test:
+	# Skip tests during package build
+	true

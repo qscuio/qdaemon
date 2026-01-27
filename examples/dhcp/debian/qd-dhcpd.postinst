@@ -1,0 +1,47 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    configure)
+        # Create qd-dhcpd user if it doesn't exist
+        if ! getent passwd qd-dhcpd > /dev/null 2>&1; then
+            adduser --system --group --no-create-home \
+                --home /var/lib/qd-dhcpd \
+                --gecos "QDaemon DHCP Server" \
+                qd-dhcpd
+        fi
+
+        # Set ownership of lease directory
+        if [ -d /var/lib/qd-dhcpd ]; then
+            chown qd-dhcpd:qd-dhcpd /var/lib/qd-dhcpd
+            chmod 750 /var/lib/qd-dhcpd
+        fi
+
+        # Set ownership of config directory
+        if [ -d /etc/qd-dhcpd ]; then
+            chown root:qd-dhcpd /etc/qd-dhcpd
+            chmod 750 /etc/qd-dhcpd
+            if [ -f /etc/qd-dhcpd/qd-dhcpd.conf ]; then
+                chown root:qd-dhcpd /etc/qd-dhcpd/qd-dhcpd.conf
+                chmod 640 /etc/qd-dhcpd/qd-dhcpd.conf
+            fi
+        fi
+
+        # Reload systemd
+        if [ -d /run/systemd/system ]; then
+            systemctl --system daemon-reload >/dev/null || true
+        fi
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

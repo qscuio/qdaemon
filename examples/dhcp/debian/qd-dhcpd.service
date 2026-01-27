@@ -1,0 +1,33 @@
+[Unit]
+Description=QDaemon Professional DHCP Server
+Documentation=man:qd_dhcpd(8)
+After=network-online.target
+Wants=network-online.target
+ConditionPathExists=/etc/qd-dhcpd/qd-dhcpd.conf
+
+[Service]
+Type=notify
+EnvironmentFile=-/etc/default/qd-dhcpd
+ExecStartPre=/sbin/modprobe qd_dhcp_kmod intercept_method=${INTERCEPT_METHOD:-3}
+ExecStart=/usr/sbin/qd_dhcpd -f -c /etc/qd-dhcpd/qd-dhcpd.conf $DAEMON_OPTS
+ExecReload=/bin/kill -HUP $MAINPID
+ExecStopPost=/sbin/rmmod qd_dhcp_kmod
+
+# Security hardening
+NoNewPrivileges=no
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+ReadWritePaths=/var/lib/qd-dhcpd /run
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE CAP_SYS_MODULE
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_RAW CAP_NET_BIND_SERVICE
+
+# Restart policy
+Restart=on-failure
+RestartSec=5s
+
+# Resource limits
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target

@@ -27,7 +27,10 @@ Module.symvers
 *.out
 examples/af_meta/src/meta_client
 examples/af_meta/src/meta_server
-examples/dhcp/src/qd_dhcpd
+examples/dhcp/qd_dhcpd
+examples/dhcp/qd_dhcp_cli
+examples/dhcp/test_rawsock
+examples/dhcp/snoop_test
 
 # Editor temporary files
 *~
@@ -35,3 +38,18 @@ examples/dhcp/src/qd_dhcpd
 *.swo
 .vscode/
 .idea/
+
+# Debian package artifacts
+*.deb
+*.ddeb
+*.buildinfo
+*.changes
+
+# Debian build directories (generated during dpkg-buildpackage)
+**/debian/.debhelper/
+**/debian/qd-dhcpd/
+**/debian/qd-dhcpd-dkms/
+**/debian/debhelper-build-stamp
+**/debian/files
+**/debian/*.substvars
+**/debian/*.postrm.debhelper

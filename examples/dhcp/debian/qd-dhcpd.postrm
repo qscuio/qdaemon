@@ -1,0 +1,33 @@
+#!/bin/sh
+set -e
+
+case "$1" in
+    purge)
+        # Remove lease database
+        rm -rf /var/lib/qd-dhcpd
+
+        # Remove qd-dhcpd user
+        if getent passwd qd-dhcpd > /dev/null 2>&1; then
+            deluser --quiet qd-dhcpd || true
+        fi
+        if getent group qd-dhcpd > /dev/null 2>&1; then
+            delgroup --quiet qd-dhcpd || true
+        fi
+
+        # Remove configuration
+        rm -rf /etc/qd-dhcpd
+        rm -f /etc/default/qd-dhcpd
+        ;;
+
+    remove|upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

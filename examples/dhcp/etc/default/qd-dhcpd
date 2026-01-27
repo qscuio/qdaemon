@@ -1,0 +1,15 @@
+# /etc/default/qd-dhcpd
+# Configuration for QDaemon DHCP Server
+
+# Kernel module intercept method:
+#   1 = dev_add_pack only
+#   2 = TC ingress only
+#   3 = Both methods (default)
+INTERCEPT_METHOD=3
+
+# Additional daemon options
+# See qd_dhcpd --help for available options
+DAEMON_OPTS=""
+
+# Uncomment to enable debug logging
+#DAEMON_OPTS="-d"

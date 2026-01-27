@@ -1,0 +1,46 @@
+#!/bin/sh
+set -e
+
+PACKAGE_NAME="qd-dhcp-kmod"
+PACKAGE_VERSION="1.0.0"
+
+case "$1" in
+    configure)
+        # Create Makefile for DKMS build
+        mkdir -p /usr/src/${PACKAGE_NAME}-${PACKAGE_VERSION}/build
+
+        cat > /usr/src/${PACKAGE_NAME}-${PACKAGE_VERSION}/build/Makefile << 'EOF'
+obj-m := qd_dhcp_kmod.o
+
+KDIR ?= /lib/modules/$(shell uname -r)/build
+
+all:
+	cp ../qd_dhcp_kmod.c .
+	cp ../dhcp_kmod.h .
+	$(MAKE) -C $(KDIR) M=$(PWD) modules
+
+clean:
+	$(MAKE) -C $(KDIR) M=$(PWD) clean
+	rm -f qd_dhcp_kmod.c dhcp_kmod.h
+EOF
+
+        # Add module to DKMS
+        if [ -x /usr/sbin/dkms ]; then
+            dkms add -m ${PACKAGE_NAME} -v ${PACKAGE_VERSION} || true
+            dkms build -m ${PACKAGE_NAME} -v ${PACKAGE_VERSION} || true
+            dkms install -m ${PACKAGE_NAME} -v ${PACKAGE_VERSION} || true
+        fi
+        ;;
+
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

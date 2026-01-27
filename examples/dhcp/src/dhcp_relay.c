@@ -8,7 +8,12 @@
 #include <net/if.h>
 #include <unistd.h>
 
+#ifdef STANDALONE
+#include "qdaemon_stub.h"
+#else
 #include <qdaemon/qd_log.h>
+#endif
+
 #include "dhcp_relay.h"
 
 /*

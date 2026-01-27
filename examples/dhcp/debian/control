@@ -1,0 +1,40 @@
+Source: qd-dhcpd
+Section: net
+Priority: optional
+Maintainer: QDaemon Team <admin@example.com>
+Build-Depends: debhelper-compat (= 13),
+               gcc,
+               make,
+               libreadline-dev
+Standards-Version: 4.6.0
+Homepage: https://github.com/qdaemon/qdaemon
+Rules-Requires-Root: no
+
+Package: qd-dhcpd
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: QDaemon Professional DHCP Server
+ A professional DHCP server with the following features:
+  - DHCP server with address pool management
+  - DHCP relay agent support (RFC 3046 Option 82)
+  - DHCP snooping via kernel module
+  - CLI management interface
+  - REST API for configuration
+  - Lease persistence and management
+ .
+ This package contains the userspace daemon and CLI tools.
+
+Package: qd-dhcpd-dkms
+Architecture: all
+Depends: ${misc:Depends}, dkms, linux-headers-generic | linux-headers
+Description: QDaemon DHCP Kernel Module (DKMS)
+ Kernel module for DHCP packet interception and snooping.
+ .
+ Features:
+  - Virtual network device (qdhcp0) for userspace communication
+  - Dual interception methods: dev_add_pack() and TC ingress hook
+  - DHCP snooping with binding table
+  - Trusted/untrusted port classification
+ .
+ This package uses DKMS to automatically build and install
+ the kernel module for your running kernel.

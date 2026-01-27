@@ -1,6 +1,10 @@
 /*
  * QDaemon DHCP Server - Main Daemon
  * Professional DHCP server with relay support, CLI, and REST API
+ *
+ * Uses raw socket bound to qdhcp0 virtual device for packet I/O.
+ * Kernel module intercepts DHCP packets and forwards them via qdhcp0
+ * with metadata header prepended.
  */
 
 #include <stdio.h>
@@ -12,13 +16,21 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/ioctl.h>
+#include <net/if.h>
+#include <linux/if_packet.h>
+#include <linux/if_ether.h>
 #include <linux/netlink.h>
 #include <linux/genetlink.h>
 
+#ifdef STANDALONE
+#include "qdaemon_stub.h"
+#else
 #include <qdaemon/qdaemon.h>
 #include <qdaemon/qd_handler.h>
 #include <qdaemon/qd_netlink.h>
 #include <qdaemon/qd_ipc.h>
+#endif
 
 #include "dhcp_protocol.h"
 #include "dhcp_server.h"
@@ -26,30 +38,7 @@
 #include "dhcp_pool.h"
 #include "dhcp_lease.h"
 #include "dhcp_ipc.h"
-
-/* Netlink commands matching kernel module */
-enum {
-    QDHCP_CMD_UNSPEC,
-    QDHCP_CMD_REGISTER,
-    QDHCP_CMD_UNREGISTER,
-    QDHCP_CMD_PACKET_UP,
-    QDHCP_CMD_PACKET_DOWN,
-    QDHCP_CMD_SET_CONFIG,
-    QDHCP_CMD_GET_STATS,
-};
-
-/* Netlink attributes matching kernel module */
-enum {
-    QDHCP_ATTR_UNSPEC,
-    QDHCP_ATTR_PACKET,
-    QDHCP_ATTR_IFINDEX,
-    QDHCP_ATTR_TIMESTAMP,
-    QDHCP_ATTR_MAC_SRC,
-    QDHCP_ATTR_MAC_DST,
-    QDHCP_ATTR_PKT_TYPE,
-    QDHCP_ATTR_MTU,
-    QDHCP_ATTR_STATS,
-};
+#include "dhcp_kmod.h"
 
 /*
  * Daemon Context
@@ -58,7 +47,11 @@ typedef struct {
     /* Framework components */
     qd_daemon_t        *daemon;
     qd_event_loop_t    *loop;
-    qd_netlink_t       *netlink;
+    qd_netlink_t       *netlink;       /* For control commands only */
+
+    /* Raw socket for packet I/O on qdhcp0 */
+    int                 raw_sock;
+    int                 qdhcp_ifindex;
 
     /* DHCP components */
     dhcp_server_t      *server;
@@ -81,6 +74,9 @@ typedef struct {
     uint8_t             server_mac[6];
     uint64_t            start_time;
 
+    /* Packet buffer */
+    uint8_t             pkt_buf[QDHCP_MAX_PKT_SIZE];
+
 } qd_dhcpd_t;
 
 static qd_dhcpd_t g_dhcpd;
@@ -91,7 +87,8 @@ static qd_dhcpd_t g_dhcpd;
 static int send_dhcp_packet_cb(const uint8_t *packet, size_t len,
                                 const uint8_t *dst_mac, uint32_t dst_ip,
                                 bool broadcast, void *arg);
-static void on_packet_received(qd_netlink_t *nl, qd_netlink_msg_t *msg, void *arg);
+static void on_raw_socket_readable(int fd, uint32_t events, void *arg);
+static int setup_raw_socket(void);
 
 /* REST API initialization (from dhcp_rest.c) */
 extern void dhcp_rest_init(dhcp_server_t *server, dhcp_relay_t *relay);
@@ -430,8 +427,7 @@ static int setup_ipc_server(void)
     g_dhcpd.ipc_handlers = qd_handler_table_create("dhcp_ipc");
     qd_handler_register_table(g_dhcpd.ipc_handlers, ipc_handler_entries);
 
-    /* Register with event loop */
-    g_dhcpd.loop = qd_daemon_get_loop(g_dhcpd.daemon);
+    /* Register with event loop (loop already set up by raw socket init) */
     qd_event_add(g_dhcpd.loop, g_dhcpd.ipc_fd, QD_EVENT_READ, on_ipc_readable, NULL);
 
     qd_log_info("IPC server listening on %s", DHCP_IPC_SOCKET_PATH);
@@ -440,35 +436,107 @@ static int setup_ipc_server(void)
 }
 
 /*
- * Packet Send Callback
+ * Raw Socket Setup - Bind to qdhcp0 virtual device
+ */
+
+static int setup_raw_socket(void)
+{
+    /* Create raw socket */
+    g_dhcpd.raw_sock = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (g_dhcpd.raw_sock < 0) {
+        qd_log_error("Cannot create raw socket: %s", strerror(errno));
+        return -1;
+    }
+
+    /* Get interface index for qdhcp0 */
+    struct ifreq ifr;
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, QDHCP_DEV_NAME, IFNAMSIZ - 1);
+
+    if (ioctl(g_dhcpd.raw_sock, SIOCGIFINDEX, &ifr) < 0) {
+        qd_log_error("Cannot get interface index for %s: %s",
+                     QDHCP_DEV_NAME, strerror(errno));
+        qd_log_error("Make sure to load the module: insmod qd_dhcp_kmod.ko");
+        close(g_dhcpd.raw_sock);
+        g_dhcpd.raw_sock = -1;
+        return -1;
+    }
+    g_dhcpd.qdhcp_ifindex = ifr.ifr_ifindex;
+
+    /* Bind to the qdhcp0 interface */
+    struct sockaddr_ll sll;
+    memset(&sll, 0, sizeof(sll));
+    sll.sll_family = AF_PACKET;
+    sll.sll_ifindex = g_dhcpd.qdhcp_ifindex;
+    sll.sll_protocol = htons(ETH_P_ALL);
+
+    if (bind(g_dhcpd.raw_sock, (struct sockaddr *)&sll, sizeof(sll)) < 0) {
+        qd_log_error("Cannot bind raw socket to %s: %s",
+                     QDHCP_DEV_NAME, strerror(errno));
+        close(g_dhcpd.raw_sock);
+        g_dhcpd.raw_sock = -1;
+        return -1;
+    }
+
+    /* Bring interface up */
+    memset(&ifr, 0, sizeof(ifr));
+    strncpy(ifr.ifr_name, QDHCP_DEV_NAME, IFNAMSIZ - 1);
+    if (ioctl(g_dhcpd.raw_sock, SIOCGIFFLAGS, &ifr) == 0) {
+        ifr.ifr_flags |= IFF_UP | IFF_RUNNING;
+        ioctl(g_dhcpd.raw_sock, SIOCSIFFLAGS, &ifr);
+    }
+
+    qd_log_info("Raw socket bound to %s (ifindex=%d)",
+                QDHCP_DEV_NAME, g_dhcpd.qdhcp_ifindex);
+
+    return 0;
+}
+
+/*
+ * Packet Send Callback - Send via raw socket with metadata header
  */
 
 static int send_dhcp_packet_cb(const uint8_t *packet, size_t len,
                                 const uint8_t *dst_mac, uint32_t dst_ip,
                                 bool broadcast, void *arg)
 {
-    (void)dst_mac;
-    (void)dst_ip;
-    (void)broadcast;
-    (void)arg;
+    int ifindex = (arg != NULL) ? *(int *)arg : 0;
 
-    /* Build full ethernet/IP/UDP packet */
-    uint8_t full_packet[1500];
+    if (g_dhcpd.raw_sock < 0)
+        return -1;
+
+    /* Build full packet with metadata header */
+    uint8_t tx_buf[QDHCP_MAX_PKT_SIZE];
     size_t offset = 0;
 
-    /* Ethernet header */
-    eth_header_t *eth = (eth_header_t *)full_packet;
+    /* Metadata header */
+    struct qdhcp_meta_hdr *meta = (struct qdhcp_meta_hdr *)tx_buf;
+    memset(meta, 0, sizeof(*meta));
+    meta->magic = QDHCP_META_MAGIC;
+    meta->version = QDHCP_META_VERSION;
+    meta->direction = QDHCP_DIR_TX;
+    meta->ifindex = ifindex;
+    meta->flags = broadcast ? QDHCP_TX_BROADCAST : QDHCP_TX_UNICAST;
+
+    /* Set MAC addresses */
+    memcpy(meta->src_mac, g_dhcpd.server_mac, 6);
     if (broadcast) {
-        memset(eth->dst, 0xff, 6);
+        memset(meta->dst_mac, 0xff, 6);
     } else {
-        memcpy(eth->dst, dst_mac, 6);
+        memcpy(meta->dst_mac, dst_mac, 6);
     }
-    memcpy(eth->src, g_dhcpd.server_mac, 6);
+
+    offset += sizeof(struct qdhcp_meta_hdr);
+
+    /* Ethernet header */
+    eth_header_t *eth = (eth_header_t *)(tx_buf + offset);
+    memcpy(eth->dst, meta->dst_mac, 6);
+    memcpy(eth->src, meta->src_mac, 6);
     eth->type = htons(0x0800);
     offset += sizeof(eth_header_t);
 
     /* IP header */
-    ip_header_t *ip = (ip_header_t *)(full_packet + offset);
+    ip_header_t *ip = (ip_header_t *)(tx_buf + offset);
     ip->ihl_version = 0x45;
     ip->tos = 0;
     ip->tot_len = htons(sizeof(ip_header_t) + sizeof(udp_header_t) + len);
@@ -484,7 +552,7 @@ static int send_dhcp_packet_cb(const uint8_t *packet, size_t len,
     offset += sizeof(ip_header_t);
 
     /* UDP header */
-    udp_header_t *udp = (udp_header_t *)(full_packet + offset);
+    udp_header_t *udp = (udp_header_t *)(tx_buf + offset);
     udp->source = htons(DHCP_SERVER_PORT);
     udp->dest = htons(DHCP_CLIENT_PORT);
     udp->len = htons(sizeof(udp_header_t) + len);
@@ -492,57 +560,105 @@ static int send_dhcp_packet_cb(const uint8_t *packet, size_t len,
     offset += sizeof(udp_header_t);
 
     /* DHCP payload */
-    memcpy(full_packet + offset, packet, len);
+    memcpy(tx_buf + offset, packet, len);
     offset += len;
 
-    /* Send via netlink */
-    qd_netlink_msg_t msg;
-    qd_netlink_msg_init(&msg, QDHCP_CMD_PACKET_DOWN);
-    qd_netlink_msg_add_attr(&msg, QDHCP_ATTR_PACKET, full_packet, offset);
+    /* Update packet length in metadata */
+    meta->pkt_len = offset - sizeof(struct qdhcp_meta_hdr);
 
-    return qd_netlink_send_msg(g_dhcpd.netlink, &msg);
+    /* Send via raw socket to qdhcp0 */
+    struct sockaddr_ll sll;
+    memset(&sll, 0, sizeof(sll));
+    sll.sll_family = AF_PACKET;
+    sll.sll_ifindex = g_dhcpd.qdhcp_ifindex;
+    sll.sll_halen = 6;
+    memcpy(sll.sll_addr, meta->dst_mac, 6);
+
+    ssize_t sent = sendto(g_dhcpd.raw_sock, tx_buf, offset, 0,
+                          (struct sockaddr *)&sll, sizeof(sll));
+    if (sent < 0) {
+        qd_log_error("Failed to send packet: %s", strerror(errno));
+        return -1;
+    }
+
+    qd_log_debug("TX: %zu bytes to ifindex %d", offset, ifindex);
+    return 0;
 }
 
 /*
- * Packet Reception
+ * Packet Reception - Handle packets from raw socket on qdhcp0
  */
 
-static void on_packet_received(qd_netlink_t *nl, qd_netlink_msg_t *msg, void *arg)
+static void on_raw_socket_readable(int fd, uint32_t events, void *arg)
 {
-    (void)nl;
+    (void)events;
     (void)arg;
 
-    if (msg->cmd != QDHCP_CMD_PACKET_UP)
+    /* Read packet with metadata header */
+    ssize_t recv_len = recv(fd, g_dhcpd.pkt_buf, sizeof(g_dhcpd.pkt_buf), 0);
+    if (recv_len < (ssize_t)sizeof(struct qdhcp_meta_hdr)) {
         return;
+    }
 
-    /* Get packet data */
-    size_t pkt_len;
-    void *pkt_data = qd_netlink_msg_get_data(msg, QDHCP_ATTR_PACKET, &pkt_len);
-    if (!pkt_data)
+    /* Parse metadata header */
+    struct qdhcp_meta_hdr *meta = (struct qdhcp_meta_hdr *)g_dhcpd.pkt_buf;
+
+    /* Validate metadata */
+    if (!QDHCP_META_VALID(meta)) {
+        qd_log_debug("RX: Invalid metadata magic/version");
         return;
+    }
 
-    /* Skip Ethernet/IP/UDP headers */
+    /* Only process RX direction (kernel to userspace) */
+    if (meta->direction != QDHCP_DIR_RX) {
+        return;
+    }
+
+    /* Get packet data after metadata */
+    uint8_t *pkt_data = g_dhcpd.pkt_buf + sizeof(struct qdhcp_meta_hdr);
+    size_t pkt_len = meta->pkt_len;
+
+    if (pkt_len < sizeof(eth_header_t) + sizeof(ip_header_t) + sizeof(udp_header_t)) {
+        qd_log_debug("RX: Packet too short");
+        return;
+    }
+
+    /* Skip Ethernet/IP/UDP headers to get DHCP payload */
     size_t header_len = sizeof(eth_header_t) + sizeof(ip_header_t) + sizeof(udp_header_t);
-    if (pkt_len < header_len + sizeof(dhcp_packet_t))
+    if (pkt_len < header_len + sizeof(dhcp_packet_t)) {
+        qd_log_debug("RX: DHCP packet too short");
         return;
+    }
 
-    dhcp_packet_t *dhcp = (dhcp_packet_t *)((uint8_t *)pkt_data + header_len);
+    dhcp_packet_t *dhcp = (dhcp_packet_t *)(pkt_data + header_len);
 
     /* Verify DHCP magic */
-    if (ntohl(dhcp->magic) != DHCP_MAGIC_COOKIE)
+    if (ntohl(dhcp->magic) != DHCP_MAGIC_COOKIE) {
+        qd_log_debug("RX: Invalid DHCP magic");
         return;
+    }
 
-    /* Extract RX info */
+    /* Extract RX info from metadata and packet headers */
     dhcp_rx_info_t rx_info;
     memset(&rx_info, 0, sizeof(rx_info));
 
-    eth_header_t *eth = (eth_header_t *)pkt_data;
-    memcpy(rx_info.src_mac, eth->src, 6);
-    memcpy(rx_info.dst_mac, eth->dst, 6);
+    rx_info.ifindex = meta->ifindex;
+    memcpy(rx_info.src_mac, meta->src_mac, 6);
+    memcpy(rx_info.dst_mac, meta->dst_mac, 6);
 
-    ip_header_t *ip = (ip_header_t *)((uint8_t *)pkt_data + sizeof(eth_header_t));
+    ip_header_t *ip = (ip_header_t *)(pkt_data + sizeof(eth_header_t));
     rx_info.src_ip = ip->saddr;
     rx_info.dst_ip = ip->daddr;
+    rx_info.is_broadcast = (meta->dst_mac[0] == 0xff);
+
+    qd_log_debug("RX: DHCP %s from %02x:%02x:%02x:%02x:%02x:%02x on ifindex %d (method=%d, trusted=%d)",
+                 dhcp_msg_type_name(meta->msg_type),
+                 meta->src_mac[0], meta->src_mac[1], meta->src_mac[2],
+                 meta->src_mac[3], meta->src_mac[4], meta->src_mac[5],
+                 meta->ifindex, meta->method, meta->trusted);
+
+    /* Store ifindex for send callback */
+    int ifindex = meta->ifindex;
 
     /* Check if this is a relay packet or direct client request */
     if (dhcp->giaddr != 0 && g_dhcpd.relay) {
@@ -550,15 +666,11 @@ static void on_packet_received(qd_netlink_t *nl, qd_netlink_msg_t *msg, void *ar
         dhcp_relay_process_server_packet(g_dhcpd.relay, dhcp, pkt_len - header_len);
     } else if (g_dhcpd.config.relay_enabled && g_dhcpd.relay && dhcp->op == DHCP_BOOTREQUEST) {
         /* Client request - check if we should relay */
-        /* Get interface index from netlink */
-        size_t attr_len;
-        void *ifindex_attr = qd_netlink_msg_get_data(msg, QDHCP_ATTR_IFINDEX, &attr_len);
-        int ifindex = ifindex_attr ? *(int *)ifindex_attr : 0;
-
         dhcp_relay_process_client_packet(g_dhcpd.relay, dhcp,
                                           pkt_len - header_len, ifindex);
     } else if (g_dhcpd.config.server_enabled) {
-        /* Process as server */
+        /* Process as server - pass ifindex in arg for send callback */
+        dhcp_server_set_send_callback(g_dhcpd.server, send_dhcp_packet_cb, &ifindex);
         dhcp_server_process_packet(g_dhcpd.server, dhcp, &rx_info);
     }
 }
@@ -612,23 +724,30 @@ static int on_init(qd_daemon_t *daemon, void *arg)
     dhcp_relay_config_t relay_cfg = DHCP_RELAY_CONFIG_DEFAULT;
     g_dhcpd.relay = dhcp_relay_create(&relay_cfg);
 
-    /* Connect to kernel module */
-    g_dhcpd.netlink = qd_netlink_create("QDHCP");
-    if (!g_dhcpd.netlink) {
-        qd_log_error("Failed to connect to QDHCP kernel module");
+    /* Setup raw socket for packet I/O on qdhcp0 */
+    if (setup_raw_socket() != 0) {
+        qd_log_error("Failed to setup raw socket");
         qd_log_error("Make sure to load the module: insmod qd_dhcp_kmod.ko");
         return -1;
     }
 
-    /* Set packet callback */
-    qd_netlink_set_callback(g_dhcpd.netlink, on_packet_received, NULL);
+    /* Register raw socket with event loop */
+    g_dhcpd.loop = qd_daemon_get_loop(g_dhcpd.daemon);
+    qd_event_add(g_dhcpd.loop, g_dhcpd.raw_sock, QD_EVENT_READ,
+                 on_raw_socket_readable, NULL);
 
-    /* Register with kernel */
-    qd_netlink_msg_t msg;
-    qd_netlink_msg_init(&msg, QDHCP_CMD_REGISTER);
-    if (qd_netlink_send_msg(g_dhcpd.netlink, &msg) != QD_OK) {
-        qd_log_error("Failed to register with kernel module");
-        return -1;
+    /* Connect to kernel module via netlink for control commands */
+    g_dhcpd.netlink = qd_netlink_create(QDHCP_GENL_NAME);
+    if (!g_dhcpd.netlink) {
+        qd_log_warn("Netlink connection failed - control commands unavailable");
+        /* Continue anyway - raw socket is sufficient for basic operation */
+    } else {
+        /* Register daemon with kernel */
+        qd_netlink_msg_t msg;
+        qd_netlink_msg_init(&msg, QDHCP_CMD_REGISTER);
+        if (qd_netlink_send_msg(g_dhcpd.netlink, &msg) != QD_OK) {
+            qd_log_warn("Failed to register with kernel module");
+        }
     }
 
     /* Setup IPC server */
@@ -663,6 +782,13 @@ static void on_shutdown(qd_daemon_t *daemon, void *arg)
 
     qd_log_info("DHCP daemon shutting down...");
 
+    /* Close raw socket */
+    if (g_dhcpd.raw_sock >= 0) {
+        qd_event_del_fd(g_dhcpd.loop, g_dhcpd.raw_sock);
+        close(g_dhcpd.raw_sock);
+        g_dhcpd.raw_sock = -1;
+    }
+
     /* Close IPC */
     if (g_dhcpd.ipc_fd >= 0) {
         qd_event_del_fd(g_dhcpd.loop, g_dhcpd.ipc_fd);
@@ -673,7 +799,7 @@ static void on_shutdown(qd_daemon_t *daemon, void *arg)
     if (g_dhcpd.ipc_handlers)
         qd_handler_table_destroy(g_dhcpd.ipc_handlers);
 
-    /* Unregister from kernel */
+    /* Unregister from kernel via netlink */
     if (g_dhcpd.netlink) {
         qd_netlink_msg_t msg;
         qd_netlink_msg_init(&msg, QDHCP_CMD_UNREGISTER);
@@ -722,6 +848,7 @@ int main(int argc, char **argv)
 {
     memset(&g_dhcpd, 0, sizeof(g_dhcpd));
     g_dhcpd.ipc_fd = -1;
+    g_dhcpd.raw_sock = -1;
 
     /* Default configuration */
     strcpy(g_dhcpd.config.lease_file, "/var/lib/qd_dhcpd/leases");

@@ -1,0 +1,12 @@
+qd-dhcpd (1.0.0-1) unstable; urgency=medium
+
+  * Initial release
+  * DHCP server with IP pool management
+  * DHCP relay agent with Option 82 support
+  * Kernel module for DHCP packet interception
+  * CLI management interface
+  * REST API for configuration
+  * Systemd service integration
+  * DKMS support for kernel module
+
+ -- QDaemon Team <admin@example.com>  Mon, 27 Jan 2025 00:00:00 +0000

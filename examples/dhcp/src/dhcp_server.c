@@ -7,7 +7,12 @@
 #include <string.h>
 #include <arpa/inet.h>
 
+#ifdef STANDALONE
+#include "qdaemon_stub.h"
+#else
 #include <qdaemon/qd_log.h>
+#endif
+
 #include "dhcp_server.h"
 
 /*

@@ -7,11 +7,30 @@
 #include <string.h>
 #include <arpa/inet.h>
 
-#include <qdaemon/qd_rest.h>
-#include <qdaemon/qd_log.h>
 #include "dhcp_server.h"
 #include "dhcp_relay.h"
 #include "dhcp_ipc.h"
+
+#ifdef STANDALONE
+
+/*
+ * Standalone build - REST API not available
+ * Provide stub initialization function
+ */
+
+#include "qdaemon_stub.h"
+
+void dhcp_rest_init(dhcp_server_t *server, dhcp_relay_t *relay)
+{
+    (void)server;
+    (void)relay;
+    qd_log_info("REST API not available in standalone build");
+}
+
+#else /* !STANDALONE */
+
+#include <qdaemon/qd_rest.h>
+#include <qdaemon/qd_log.h>
 
 /*
  * REST Router
@@ -409,3 +428,5 @@ qd_rest_router_t *dhcp_rest_get_router(void)
 {
     return &g_rest_router;
 }
+
+#endif /* !STANDALONE */

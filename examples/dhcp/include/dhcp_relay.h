@@ -8,7 +8,11 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#ifdef STANDALONE
+#include "qdaemon_stub.h"
+#else
 #include <qdaemon/qd_event.h>
+#endif
 #include "dhcp_protocol.h"
 #include "dhcp_option.h"
 
