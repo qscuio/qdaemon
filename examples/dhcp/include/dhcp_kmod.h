@@ -125,7 +125,20 @@ enum {
     QDHCP_CMD_CLEAR_BINDINGS,   /* Clear all bindings */
     QDHCP_CMD_SET_METHOD,       /* Set interception method */
     QDHCP_CMD_GET_STATS,        /* Get statistics */
+    QDHCP_CMD_NOTIFY_BINDING,   /* Binding change notification */
+    QDHCP_CMD_NOTIFY_IFACE,     /* Interface change notification */
     __QDHCP_CMD_MAX,
+};
+
+/*
+ * Event types for notifications
+ */
+enum {
+    QDHCP_EVENT_NONE = 0,
+    QDHCP_EVENT_BINDING_ADD,    /* Binding was added */
+    QDHCP_EVENT_BINDING_DEL,    /* Binding was deleted */
+    QDHCP_EVENT_IFACE_ADD,      /* Interface was added */
+    QDHCP_EVENT_IFACE_DEL,      /* Interface was deleted */
 };
 
 /*
@@ -141,8 +154,14 @@ enum {
     QDHCP_ATTR_LEASE_TIME,      /* Lease time */
     QDHCP_ATTR_METHOD,          /* Interception method */
     QDHCP_ATTR_STATS,           /* Statistics blob */
+    QDHCP_ATTR_EVENT_TYPE,      /* Event type for notifications */
     __QDHCP_ATTR_MAX,
 };
+
+/*
+ * Multicast group name for notifications
+ */
+#define QDHCP_MCGRP_NAME        "qdhcp_events"
 
 /*
  * Statistics structure

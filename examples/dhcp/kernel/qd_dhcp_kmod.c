@@ -106,11 +106,84 @@ static struct packet_type qdhcp_ptype;
 static bool ptype_registered;
 
 /*
+ * Multicast group for notifications
+ */
+static const struct genl_multicast_group qdhcp_mcgrps[] = {
+    { .name = QDHCP_MCGRP_NAME },
+};
+
+enum qdhcp_mcgrp_ids {
+    QDHCP_MCGRP_EVENTS,
+};
+
+/*
  * Hash function for MAC address
  */
 static inline u32 mac_hash(const u8 *mac)
 {
     return jhash(mac, ETH_ALEN, 0);
+}
+
+/*
+ * Notification Functions
+ */
+static void qdhcp_notify_binding_change(const u8 *mac, __be32 ip, int ifindex,
+                                         u32 lease_time, u8 event_type)
+{
+    struct sk_buff *skb;
+    void *hdr;
+
+    skb = genlmsg_new(NLMSG_GOODSIZE, GFP_ATOMIC);
+    if (!skb)
+        return;
+
+    hdr = genlmsg_put(skb, 0, 0, &qdhcp_genl_family, 0, QDHCP_CMD_NOTIFY_BINDING);
+    if (!hdr) {
+        nlmsg_free(skb);
+        return;
+    }
+
+    if (nla_put_u8(skb, QDHCP_ATTR_EVENT_TYPE, event_type) ||
+        nla_put(skb, QDHCP_ATTR_MAC, ETH_ALEN, mac) ||
+        nla_put_u32(skb, QDHCP_ATTR_IP, ntohl(ip)) ||
+        nla_put_s32(skb, QDHCP_ATTR_IFINDEX, ifindex) ||
+        nla_put_u32(skb, QDHCP_ATTR_LEASE_TIME, lease_time)) {
+        genlmsg_cancel(skb, hdr);
+        nlmsg_free(skb);
+        return;
+    }
+
+    genlmsg_end(skb, hdr);
+    genlmsg_multicast(&qdhcp_genl_family, skb, 0, QDHCP_MCGRP_EVENTS, GFP_ATOMIC);
+}
+
+static void qdhcp_notify_iface_change(int ifindex, const char *ifname,
+                                       bool trusted, u8 event_type)
+{
+    struct sk_buff *skb;
+    void *hdr;
+
+    skb = genlmsg_new(NLMSG_GOODSIZE, GFP_ATOMIC);
+    if (!skb)
+        return;
+
+    hdr = genlmsg_put(skb, 0, 0, &qdhcp_genl_family, 0, QDHCP_CMD_NOTIFY_IFACE);
+    if (!hdr) {
+        nlmsg_free(skb);
+        return;
+    }
+
+    if (nla_put_u8(skb, QDHCP_ATTR_EVENT_TYPE, event_type) ||
+        nla_put_s32(skb, QDHCP_ATTR_IFINDEX, ifindex) ||
+        nla_put_string(skb, QDHCP_ATTR_IFNAME, ifname) ||
+        nla_put_u8(skb, QDHCP_ATTR_TRUSTED, trusted ? 1 : 0)) {
+        genlmsg_cancel(skb, hdr);
+        nlmsg_free(skb);
+        return;
+    }
+
+    genlmsg_end(skb, hdr);
+    genlmsg_multicast(&qdhcp_genl_family, skb, 0, QDHCP_MCGRP_EVENTS, GFP_ATOMIC);
 }
 
 /*
@@ -133,6 +206,7 @@ static int binding_add(struct qdhcp_priv *priv, const u8 *mac, __be32 ip,
 {
     struct binding_entry *entry;
     unsigned long flags;
+    bool is_new = false;
 
     spin_lock_irqsave(&priv->bind_lock, flags);
 
@@ -143,6 +217,9 @@ static int binding_add(struct qdhcp_priv *priv, const u8 *mac, __be32 ip,
         entry->lease_time = lease_time;
         entry->expire_time_ns = ktime_get_ns() + (u64)lease_time * NSEC_PER_SEC;
         spin_unlock_irqrestore(&priv->bind_lock, flags);
+        /* Notify even for updates */
+        qdhcp_notify_binding_change(mac, ip, ifindex, lease_time,
+                                    QDHCP_EVENT_BINDING_ADD);
         return 0;
     }
 
@@ -160,8 +237,14 @@ static int binding_add(struct qdhcp_priv *priv, const u8 *mac, __be32 ip,
 
     hash_add(priv->bindings, &entry->hash_node, mac_hash(mac));
     priv->bind_count++;
+    is_new = true;
 
     spin_unlock_irqrestore(&priv->bind_lock, flags);
+
+    /* Send notification for new binding */
+    if (is_new)
+        qdhcp_notify_binding_change(mac, ip, ifindex, lease_time,
+                                    QDHCP_EVENT_BINDING_ADD);
     return 0;
 }
 
@@ -169,6 +252,9 @@ static int binding_del(struct qdhcp_priv *priv, const u8 *mac)
 {
     struct binding_entry *entry;
     unsigned long flags;
+    __be32 ip;
+    int ifindex;
+    u32 lease_time;
 
     spin_lock_irqsave(&priv->bind_lock, flags);
 
@@ -178,12 +264,21 @@ static int binding_del(struct qdhcp_priv *priv, const u8 *mac)
         return -ENOENT;
     }
 
+    /* Save info for notification */
+    ip = entry->ip;
+    ifindex = entry->ifindex;
+    lease_time = entry->lease_time;
+
     hash_del(&entry->hash_node);
     priv->bind_count--;
 
     spin_unlock_irqrestore(&priv->bind_lock, flags);
 
     kfree(entry);
+
+    /* Send notification */
+    qdhcp_notify_binding_change(mac, ip, ifindex, lease_time,
+                                QDHCP_EVENT_BINDING_DEL);
     return 0;
 }
 
@@ -235,6 +330,7 @@ static int iface_add(struct qdhcp_priv *priv, int ifindex, const char *name)
 {
     unsigned long flags;
     int i;
+    bool is_new = false;
 
     spin_lock_irqsave(&priv->iface_lock, flags);
 
@@ -256,10 +352,16 @@ static int iface_add(struct qdhcp_priv *priv, int ifindex, const char *name)
     priv->ifaces[priv->iface_count].trusted = false;
     priv->ifaces[priv->iface_count].active = true;
     priv->iface_count++;
+    is_new = true;
 
     spin_unlock_irqrestore(&priv->iface_lock, flags);
 
     pr_info("qdhcp: added interface %s (ifindex=%d)\n", name, ifindex);
+
+    /* Send notification */
+    if (is_new)
+        qdhcp_notify_iface_change(ifindex, name, false, QDHCP_EVENT_IFACE_ADD);
+
     return 0;
 }
 
@@ -267,6 +369,8 @@ static int iface_del(struct qdhcp_priv *priv, int ifindex)
 {
     struct monitored_iface *iface;
     unsigned long flags;
+    char ifname[IFNAMSIZ];
+    bool trusted;
 
     spin_lock_irqsave(&priv->iface_lock, flags);
 
@@ -276,9 +380,17 @@ static int iface_del(struct qdhcp_priv *priv, int ifindex)
         return -ENOENT;
     }
 
+    /* Save info for notification */
+    strscpy(ifname, iface->ifname, IFNAMSIZ);
+    trusted = iface->trusted;
+
     iface->active = false;
 
     spin_unlock_irqrestore(&priv->iface_lock, flags);
+
+    /* Send notification */
+    qdhcp_notify_iface_change(ifindex, ifname, trusted, QDHCP_EVENT_IFACE_DEL);
+
     return 0;
 }
 
@@ -690,6 +802,7 @@ static struct nla_policy qdhcp_genl_policy[__QDHCP_ATTR_MAX] = {
     [QDHCP_ATTR_LEASE_TIME] = { .type = NLA_U32 },
     [QDHCP_ATTR_METHOD]     = { .type = NLA_U8 },
     [QDHCP_ATTR_STATS]      = { .type = NLA_BINARY },
+    [QDHCP_ATTR_EVENT_TYPE] = { .type = NLA_U8 },
 };
 
 /*
@@ -900,6 +1013,8 @@ static struct genl_family qdhcp_genl_family = {
     .maxattr    = __QDHCP_ATTR_MAX - 1,
     .ops        = qdhcp_genl_ops,
     .n_ops      = ARRAY_SIZE(qdhcp_genl_ops),
+    .mcgrps     = qdhcp_mcgrps,
+    .n_mcgrps   = ARRAY_SIZE(qdhcp_mcgrps),
     .module     = THIS_MODULE,
 };
 

@@ -45,7 +45,8 @@ COMMON_SRCS = \
 	src/dhcp_lease.c \
 	src/dhcp_server.c \
 	src/dhcp_relay.c \
-	src/dhcp_rest.c
+	src/dhcp_rest.c \
+	src/qd_dhcp_nl.c
 
 DAEMON_SRCS = \
 	src/qd_dhcpd.c \
@@ -134,7 +135,8 @@ src/dhcp_lease.o: include/dhcp_lease.h include/dhcp_protocol.h
 src/dhcp_server.o: include/dhcp_server.h include/dhcp_pool.h include/dhcp_lease.h include/dhcp_option.h
 src/dhcp_relay.o: include/dhcp_relay.h include/dhcp_option.h include/dhcp_protocol.h
 src/dhcp_rest.o: include/dhcp_server.h include/dhcp_relay.h include/dhcp_ipc.h
-src/qd_dhcpd.o: include/dhcp_protocol.h include/dhcp_server.h include/dhcp_relay.h include/dhcp_ipc.h
+src/qd_dhcp_nl.o: include/qd_dhcp_nl.h include/dhcp_kmod.h src/qd_dhcp_nl_internal.h
+src/qd_dhcpd.o: include/dhcp_protocol.h include/dhcp_server.h include/dhcp_relay.h include/dhcp_ipc.h include/qd_dhcp_nl.h
 cli/qd_dhcp_cli.o: include/dhcp_ipc.h include/dhcp_protocol.h
 
 .PHONY: all clean test kmods kmods-clean install install-system deb deb-clean
