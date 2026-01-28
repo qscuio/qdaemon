@@ -40,6 +40,7 @@
 #include <net/sch_generic.h>
 
 #include "../include/dhcp_kmod.h"
+#include "qd_dhcp_bde.h"
 
 MODULE_LICENSE("GPL");
 MODULE_AUTHOR("QDaemon");
@@ -1886,6 +1887,15 @@ static int __init qdhcp_init(void)
         pr_info("qdhcp: char device %s registered\n", QDHCP_CHARDEV_NAME);
     }
 
+    /* Register BDE transport (mmap-based shared memory) */
+    ret = qdhcp_bde_init();
+    if (ret < 0) {
+        pr_warn("qdhcp: BDE transport init failed: %d\n", ret);
+        /* Non-fatal - continue without BDE */
+    } else {
+        pr_info("qdhcp: BDE transport registered\n");
+    }
+
     pr_info("qdhcp: loaded, device %s created\n", QDHCP_DEV_NAME);
     return 0;
 }
@@ -1893,6 +1903,9 @@ static int __init qdhcp_init(void)
 static void __exit qdhcp_exit(void)
 {
     struct qdhcp_priv *priv;
+
+    /* Unregister BDE transport */
+    qdhcp_bde_exit();
 
     /* Unregister char device */
     if (chardev_registered) {

@@ -179,6 +179,7 @@ typedef enum {
     QD_DHCP_TRANSPORT_AUTO = 0,     /* Auto-detect best transport */
     QD_DHCP_TRANSPORT_NETLINK,      /* Generic Netlink */
     QD_DHCP_TRANSPORT_CHARDEV,      /* Character device (/dev/qdhcp_ctl) */
+    QD_DHCP_TRANSPORT_BDE,          /* BDE mmap-based (/dev/qdhcp_bde) */
 } qd_dhcp_transport_type_t;
 
 /*

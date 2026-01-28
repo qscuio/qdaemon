@@ -1,13 +1,17 @@
 # DHCP Kernel Module Makefile
 #
-# Builds qd_dhcp_kmod.ko with:
+# Builds qd_dhcp.ko with:
 # - Virtual network device (qdhcp0) for userspace communication
 # - DHCP packet interception via dev_add_pack() and TC ingress hook
 # - DHCP snooping with binding table
-# - Netlink for control messages
+# - Netlink and char device for control messages
+# - BDE (mmap-based) transport layer
 #
 
-obj-m := qd_dhcp_kmod.o
+obj-m := qd_dhcp.o
+
+# Multi-file module: combine main kmod and BDE into single .ko
+qd_dhcp-y := qd_dhcp_kmod.o qd_dhcp_bde.o
 
 KDIR ?= /lib/modules/$(shell uname -r)/build
 ROOTDIR ?= $(abspath $(CURDIR)/../../..)
@@ -28,17 +32,17 @@ install:
 
 # Load with both interception methods (default)
 load:
-	insmod qd_dhcp_kmod.ko intercept_method=3
+	insmod qd_dhcp.ko intercept_method=3
 
 # Load with dev_add_pack only
 load-pack:
-	insmod qd_dhcp_kmod.ko intercept_method=1
+	insmod qd_dhcp.ko intercept_method=1
 
 # Load with TC ingress only
 load-tc:
-	insmod qd_dhcp_kmod.ko intercept_method=2
+	insmod qd_dhcp.ko intercept_method=2
 
 unload:
-	rmmod qd_dhcp_kmod
+	rmmod qd_dhcp
 
 .PHONY: all clean install load load-pack load-tc unload

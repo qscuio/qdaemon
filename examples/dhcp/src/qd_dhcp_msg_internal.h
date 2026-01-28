@@ -319,6 +319,7 @@ typedef struct qd_dhcp_msg_builder {
 /* Transport creation (factory functions) */
 qd_dhcp_transport_t *qd_dhcp_transport_netlink_create(void);
 qd_dhcp_transport_t *qd_dhcp_transport_chardev_create(const char *path);
+qd_dhcp_transport_t *qd_dhcp_transport_bde_create(void);
 void qd_dhcp_transport_destroy(qd_dhcp_transport_t *transport);
 
 /* Message builder functions */

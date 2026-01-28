@@ -920,6 +920,317 @@ qd_dhcp_transport_t *qd_dhcp_transport_chardev_create(const char *path)
 
 /*
  * ==========================================================================
+ * BDE (mmap-based) Transport Implementation
+ * ==========================================================================
+ */
+
+#include <sys/mman.h>
+#include "../include/dhcp_bde.h"
+
+typedef struct {
+    int                         fd;
+    void                       *shm_base;
+    size_t                      shm_size;
+    struct qdhcp_bde_shm_hdr   *shm_hdr;
+    void                       *tx_ring;
+    void                       *rx_ring;
+    bool                        subscribed;
+    uint32_t                    seq;
+} bde_priv_t;
+
+static int bde_open(qd_dhcp_transport_t *transport)
+{
+    bde_priv_t *priv = transport->priv;
+    struct qdhcp_bde_dma_info dma_info;
+    void *mem;
+    int ret;
+
+    priv->fd = open(QDHCP_BDE_PATH, O_RDWR | O_CLOEXEC);
+    if (priv->fd < 0) {
+        transport->last_error = errno;
+        return QD_DHCP_ERR_IO;
+    }
+
+    /* Get DMA/shared memory info */
+    ret = ioctl(priv->fd, QDHCP_BDE_IOC_GET_DMA_INFO, &dma_info);
+    if (ret < 0) {
+        transport->last_error = errno;
+        close(priv->fd);
+        priv->fd = -1;
+        return QD_DHCP_ERR_IO;
+    }
+
+    priv->shm_size = dma_info.size;
+
+    /* mmap the shared memory */
+    mem = mmap(NULL, priv->shm_size, PROT_READ | PROT_WRITE,
+               MAP_SHARED, priv->fd, 0);
+    if (mem == MAP_FAILED) {
+        transport->last_error = errno;
+        close(priv->fd);
+        priv->fd = -1;
+        return QD_DHCP_ERR_IO;
+    }
+
+    priv->shm_base = mem;
+    priv->shm_hdr = (struct qdhcp_bde_shm_hdr *)mem;
+
+    /* Validate magic */
+    if (priv->shm_hdr->magic != QDHCP_BDE_MAGIC) {
+        munmap(priv->shm_base, priv->shm_size);
+        close(priv->fd);
+        priv->fd = -1;
+        priv->shm_base = NULL;
+        return QD_DHCP_ERR_PROTO;
+    }
+
+    /* Set up ring pointers */
+    priv->tx_ring = (char *)mem + priv->shm_hdr->tx_ring_offset;
+    priv->rx_ring = (char *)mem + priv->shm_hdr->rx_ring_offset;
+
+    return QD_DHCP_OK;
+}
+
+static void bde_close(qd_dhcp_transport_t *transport)
+{
+    bde_priv_t *priv = transport->priv;
+
+    if (priv->shm_base) {
+        munmap(priv->shm_base, priv->shm_size);
+        priv->shm_base = NULL;
+        priv->shm_hdr = NULL;
+        priv->tx_ring = NULL;
+        priv->rx_ring = NULL;
+    }
+
+    if (priv->fd >= 0) {
+        close(priv->fd);
+        priv->fd = -1;
+    }
+}
+
+static int bde_get_fd(qd_dhcp_transport_t *transport)
+{
+    bde_priv_t *priv = transport->priv;
+    return priv->fd;
+}
+
+static int bde_send(qd_dhcp_transport_t *transport,
+                    const void *data, size_t len)
+{
+    bde_priv_t *priv = transport->priv;
+    struct qdhcp_bde_shm_hdr *hdr;
+    struct qdhcp_bde_slot_hdr *slot;
+    const qd_dhcp_msg_hdr_t *msg_hdr;
+    uint32_t head, next_head;
+
+    if (priv->fd < 0 || !priv->shm_hdr)
+        return QD_DHCP_ERR_NOCONN;
+
+    /* Validate message */
+    if (len < QD_DHCP_MSG_HDR_SIZE)
+        return QD_DHCP_ERR_INVALID;
+
+    msg_hdr = data;
+    if (msg_hdr->magic != QD_DHCP_MSG_MAGIC)
+        return QD_DHCP_ERR_INVALID;
+
+    /* Check slot data size limit */
+    if (len > QDHCP_BDE_SLOT_DATA_MAX)
+        return QD_DHCP_ERR_NOMEM;
+
+    hdr = priv->shm_hdr;
+
+    /* Read barrier before reading indices */
+    QDHCP_BDE_READ_BARRIER();
+
+    head = hdr->tx_head;
+    next_head = QDHCP_BDE_NEXT_IDX(head, hdr->tx_slot_count);
+
+    /* Check if ring is full */
+    if (next_head == hdr->tx_tail)
+        return QD_DHCP_ERR_FULL;
+
+    /* Get slot and fill it */
+    slot = QDHCP_BDE_SLOT_PTR(priv->tx_ring, head, hdr->tx_slot_size);
+    slot->magic = QDHCP_BDE_SLOT_MAGIC;
+    slot->len = len;
+    slot->flags = QDHCP_BDE_SLOT_READY;
+    slot->msg_type = msg_hdr->cmd;
+    slot->seq = msg_hdr->seq;
+
+    memcpy(QDHCP_BDE_SLOT_DATA(slot), data, len);
+
+    /* Write barrier before updating head */
+    QDHCP_BDE_WRITE_BARRIER();
+
+    hdr->tx_head = next_head;
+
+    /* Notify kernel of TX data */
+    if (ioctl(priv->fd, QDHCP_BDE_IOC_TX_NOTIFY, NULL) < 0) {
+        transport->last_error = errno;
+        /* Don't fail - message is in ring */
+    }
+
+    return QD_DHCP_OK;
+}
+
+static int bde_recv(qd_dhcp_transport_t *transport,
+                    void *buf, size_t buf_size, int flags)
+{
+    bde_priv_t *priv = transport->priv;
+    struct qdhcp_bde_shm_hdr *hdr;
+    struct qdhcp_bde_slot_hdr *slot;
+    uint32_t tail;
+    size_t data_len;
+
+    if (priv->fd < 0 || !priv->shm_hdr)
+        return QD_DHCP_ERR_NOCONN;
+
+    hdr = priv->shm_hdr;
+
+    /* Handle blocking vs non-blocking */
+    if (!(flags & QD_DHCP_RECV_NONBLOCK)) {
+        /* Wait for RX data */
+        struct qdhcp_bde_wait_info wait_info = {
+            .events = QDHCP_BDE_WAIT_RX_READY,
+            .timeout_ms = 5000,
+            .result = 0,
+        };
+
+        if (ioctl(priv->fd, QDHCP_BDE_IOC_WAIT, &wait_info) < 0) {
+            if (errno == ETIMEDOUT)
+                return 0;
+            transport->last_error = errno;
+            return QD_DHCP_ERR_IO;
+        }
+
+        if (!(wait_info.result & QDHCP_BDE_WAIT_RX_READY))
+            return 0;
+    }
+
+    /* Read barrier before checking ring */
+    QDHCP_BDE_READ_BARRIER();
+
+    /* Check if RX ring is empty */
+    if (QDHCP_BDE_RING_EMPTY(hdr->rx_head, hdr->rx_tail))
+        return 0;
+
+    tail = hdr->rx_tail;
+    slot = QDHCP_BDE_SLOT_PTR(priv->rx_ring, tail, hdr->rx_slot_size);
+
+    /* Validate slot */
+    if (slot->magic != QDHCP_BDE_SLOT_MAGIC) {
+        /* Skip bad slot */
+        QDHCP_BDE_WRITE_BARRIER();
+        hdr->rx_tail = QDHCP_BDE_NEXT_IDX(tail, hdr->rx_slot_count);
+        return QD_DHCP_ERR_PROTO;
+    }
+
+    if (!(slot->flags & QDHCP_BDE_SLOT_READY))
+        return 0;
+
+    data_len = slot->len;
+    if (data_len > buf_size)
+        return QD_DHCP_ERR_NOMEM;
+
+    /* Copy data if not peeking */
+    if (!(flags & QD_DHCP_RECV_PEEK)) {
+        memcpy(buf, QDHCP_BDE_SLOT_DATA(slot), data_len);
+
+        /* Clear slot and advance tail */
+        slot->flags &= ~QDHCP_BDE_SLOT_READY;
+
+        QDHCP_BDE_WRITE_BARRIER();
+        hdr->rx_tail = QDHCP_BDE_NEXT_IDX(tail, hdr->rx_slot_count);
+
+        /* Notify kernel RX was consumed */
+        ioctl(priv->fd, QDHCP_BDE_IOC_RX_COMPLETE, NULL);
+    } else {
+        memcpy(buf, QDHCP_BDE_SLOT_DATA(slot), data_len);
+    }
+
+    return data_len;
+}
+
+static int bde_subscribe(qd_dhcp_transport_t *transport)
+{
+    bde_priv_t *priv = transport->priv;
+
+    if (priv->fd < 0)
+        return QD_DHCP_ERR_NOCONN;
+
+    if (ioctl(priv->fd, QDHCP_BDE_IOC_SUBSCRIBE, NULL) < 0) {
+        transport->last_error = errno;
+        return QD_DHCP_ERR_IO;
+    }
+
+    priv->subscribed = true;
+    return QD_DHCP_OK;
+}
+
+static int bde_unsubscribe(qd_dhcp_transport_t *transport)
+{
+    bde_priv_t *priv = transport->priv;
+
+    if (priv->fd < 0)
+        return QD_DHCP_ERR_NOCONN;
+
+    if (ioctl(priv->fd, QDHCP_BDE_IOC_UNSUBSCRIBE, NULL) < 0) {
+        transport->last_error = errno;
+        return QD_DHCP_ERR_IO;
+    }
+
+    priv->subscribed = false;
+    return QD_DHCP_OK;
+}
+
+static bool bde_is_connected(qd_dhcp_transport_t *transport)
+{
+    bde_priv_t *priv = transport->priv;
+    return priv->fd >= 0 && priv->shm_hdr != NULL;
+}
+
+static const char *bde_strerror(qd_dhcp_transport_t *transport, int error)
+{
+    (void)error;
+    return strerror(transport->last_error);
+}
+
+static const qd_dhcp_transport_ops_t bde_ops = {
+    .name         = "bde",
+    .open         = bde_open,
+    .close        = bde_close,
+    .get_fd       = bde_get_fd,
+    .send         = bde_send,
+    .recv         = bde_recv,
+    .subscribe    = bde_subscribe,
+    .unsubscribe  = bde_unsubscribe,
+    .is_connected = bde_is_connected,
+    .strerror     = bde_strerror,
+};
+
+qd_dhcp_transport_t *qd_dhcp_transport_bde_create(void)
+{
+    qd_dhcp_transport_t *transport = calloc(1, sizeof(*transport));
+    if (!transport)
+        return NULL;
+
+    bde_priv_t *priv = calloc(1, sizeof(*priv));
+    if (!priv) {
+        free(transport);
+        return NULL;
+    }
+
+    priv->fd = -1;
+    transport->ops = &bde_ops;
+    transport->priv = priv;
+
+    return transport;
+}
+
+/*
+ * ==========================================================================
  * Handler Management
  * ==========================================================================
  */
@@ -1369,20 +1680,29 @@ qd_dhcp_conn_t *qd_dhcp_connect(const qd_dhcp_conn_config_t *config)
     /* Create transport based on configuration */
     qd_dhcp_transport_type_t transport_type = conn->config.transport;
 
-    /* Auto-detect: try chardev first (if path exists), then netlink */
+    /* Auto-detect: try BDE first, then chardev, then netlink */
     if (transport_type == QD_DHCP_TRANSPORT_AUTO) {
-        const char *chardev_path = conn->config.chardev_path;
-        if (!chardev_path)
-            chardev_path = QDHCP_CHARDEV_PATH;
-
-        if (access(chardev_path, R_OK | W_OK) == 0) {
-            transport_type = QD_DHCP_TRANSPORT_CHARDEV;
+        /* Prefer BDE (mmap-based) for best performance */
+        if (access(QDHCP_BDE_PATH, R_OK | W_OK) == 0) {
+            transport_type = QD_DHCP_TRANSPORT_BDE;
         } else {
-            transport_type = QD_DHCP_TRANSPORT_NETLINK;
+            const char *chardev_path = conn->config.chardev_path;
+            if (!chardev_path)
+                chardev_path = QDHCP_CHARDEV_PATH;
+
+            if (access(chardev_path, R_OK | W_OK) == 0) {
+                transport_type = QD_DHCP_TRANSPORT_CHARDEV;
+            } else {
+                transport_type = QD_DHCP_TRANSPORT_NETLINK;
+            }
         }
     }
 
     switch (transport_type) {
+    case QD_DHCP_TRANSPORT_BDE:
+        conn->transport = qd_dhcp_transport_bde_create();
+        break;
+
     case QD_DHCP_TRANSPORT_CHARDEV:
         conn->transport = qd_dhcp_transport_chardev_create(conn->config.chardev_path);
         break;
@@ -1406,28 +1726,40 @@ qd_dhcp_conn_t *qd_dhcp_connect(const qd_dhcp_conn_config_t *config)
 
     /* Open transport connection */
     int ret = conn->transport->ops->open(conn->transport);
-    if (ret != QD_DHCP_OK) {
-        /* If chardev fails, fall back to netlink (for AUTO mode) */
-        if (conn->config.transport == QD_DHCP_TRANSPORT_AUTO &&
-            transport_type == QD_DHCP_TRANSPORT_CHARDEV) {
+    if (ret != QD_DHCP_OK && conn->config.transport == QD_DHCP_TRANSPORT_AUTO) {
+        /* AUTO mode fallback: BDE -> chardev -> netlink */
+        if (transport_type == QD_DHCP_TRANSPORT_BDE) {
+            /* Try chardev next */
+            qd_dhcp_transport_destroy(conn->transport);
+            conn->transport = qd_dhcp_transport_chardev_create(conn->config.chardev_path);
+            if (conn->transport) {
+                ret = conn->transport->ops->open(conn->transport);
+                transport_type = QD_DHCP_TRANSPORT_CHARDEV;
+            }
+        }
+
+        if (ret != QD_DHCP_OK &&
+            (transport_type == QD_DHCP_TRANSPORT_CHARDEV ||
+             transport_type == QD_DHCP_TRANSPORT_BDE)) {
+            /* Try netlink as last resort */
             qd_dhcp_transport_destroy(conn->transport);
             conn->transport = qd_dhcp_transport_netlink_create();
             if (conn->transport) {
                 ret = conn->transport->ops->open(conn->transport);
             }
         }
+    }
 
-        if (ret != QD_DHCP_OK) {
-            qd_dhcp_transport_destroy(conn->transport);
-            free(conn->rx_buf);
-            free(conn->tx_buf);
-            pthread_mutex_destroy(&conn->seq_lock);
-            pthread_mutex_destroy(&conn->pending_lock);
-            pthread_mutex_destroy(&conn->handler_lock);
-            pthread_mutex_destroy(&conn->stats_lock);
-            free(conn);
-            return NULL;
-        }
+    if (ret != QD_DHCP_OK) {
+        qd_dhcp_transport_destroy(conn->transport);
+        free(conn->rx_buf);
+        free(conn->tx_buf);
+        pthread_mutex_destroy(&conn->seq_lock);
+        pthread_mutex_destroy(&conn->pending_lock);
+        pthread_mutex_destroy(&conn->handler_lock);
+        pthread_mutex_destroy(&conn->stats_lock);
+        free(conn);
+        return NULL;
     }
 
     /* Notify connection */

@@ -135,7 +135,7 @@ src/dhcp_lease.o: include/dhcp_lease.h include/dhcp_protocol.h
 src/dhcp_server.o: include/dhcp_server.h include/dhcp_pool.h include/dhcp_lease.h include/dhcp_option.h
 src/dhcp_relay.o: include/dhcp_relay.h include/dhcp_option.h include/dhcp_protocol.h
 src/dhcp_rest.o: include/dhcp_server.h include/dhcp_relay.h include/dhcp_ipc.h
-src/qd_dhcp_msg.o: include/qd_dhcp_msg.h include/dhcp_kmod.h src/qd_dhcp_msg_internal.h
+src/qd_dhcp_msg.o: include/qd_dhcp_msg.h include/dhcp_kmod.h include/dhcp_bde.h src/qd_dhcp_msg_internal.h
 src/qd_dhcpd.o: include/dhcp_protocol.h include/dhcp_server.h include/dhcp_relay.h include/dhcp_ipc.h include/qd_dhcp_msg.h
 cli/qd_dhcp_cli.o: include/dhcp_ipc.h include/dhcp_protocol.h
 
