@@ -27,6 +27,13 @@
 #include <linux/ip.h>
 #include <linux/udp.h>
 #include <linux/hashtable.h>
+#include <linux/miscdevice.h>
+#include <linux/fs.h>
+#include <linux/poll.h>
+#include <linux/uaccess.h>
+#include <linux/wait.h>
+#include <linux/list.h>
+#include <linux/slab.h>
 #include <net/genetlink.h>
 #include <net/netlink.h>
 #include <net/pkt_cls.h>
@@ -53,6 +60,70 @@ MODULE_PARM_DESC(intercept_method, "Interception method: 1=dev_add_pack, 2=TC, 3
 #define DHCP_CLIENT_PORT     68
 #define BINDING_HASH_BITS    8
 #define MAX_INTERFACES       32
+
+/*
+ * Char device wire format - matches userspace qd_dhcp_msg_hdr_t
+ */
+#define QDHCP_MSG_MAGIC       0x51444843  /* "QDHC" */
+#define QDHCP_MSG_VERSION     1
+
+/* Message flags */
+#define QDHCP_MSG_FLAG_ACK        0x01  /* Request acknowledgment */
+#define QDHCP_MSG_FLAG_RESPONSE   0x02  /* This is a response */
+#define QDHCP_MSG_FLAG_ERROR      0x04  /* Error response */
+#define QDHCP_MSG_FLAG_NOTIFY     0x20  /* Notification (no ACK expected) */
+
+struct qdhcp_msg_hdr {
+    __u32 magic;
+    __u8  version;
+    __u8  cmd;
+    __u8  flags;
+    __u8  reserved;
+    __u32 seq;
+    __u32 len;
+    __s32 status;
+} __packed;
+
+#define QDHCP_MSG_HDR_SIZE    sizeof(struct qdhcp_msg_hdr)
+
+/* Attribute header */
+struct qdhcp_attr_hdr {
+    __u16 type;
+    __u16 len;    /* Including header */
+} __packed;
+
+#define QDHCP_ATTR_HDR_SIZE   sizeof(struct qdhcp_attr_hdr)
+#define QDHCP_ATTR_ALIGN(len) (((len) + 3) & ~3)
+
+/* IOCTL commands for char device */
+#define QDHCP_IOC_MAGIC     'Q'
+#define QDHCP_IOC_SUBSCRIBE   _IO(QDHCP_IOC_MAGIC, 1)
+#define QDHCP_IOC_UNSUBSCRIBE _IO(QDHCP_IOC_MAGIC, 2)
+
+/* Char device constants */
+#define QDHCP_CHARDEV_MSG_QUEUE_MAX   64
+#define QDHCP_CHARDEV_MSG_MAX_SIZE    4096
+
+/*
+ * Queued message for char device notification delivery
+ */
+struct qdhcp_queued_msg {
+    struct list_head list;
+    size_t           len;
+    u8               data[];
+};
+
+/*
+ * Per-client private data for char device
+ */
+struct qdhcp_chardev_client {
+    struct list_head    list;           /* In clients list */
+    spinlock_t          lock;
+    bool                subscribed;     /* Receiving notifications? */
+    struct list_head    msg_queue;      /* Queued messages */
+    int                 queue_count;
+    wait_queue_head_t   wait_queue;
+};
 
 /*
  * Binding Table Entry
@@ -104,6 +175,18 @@ static struct net_device *qdhcp_netdev;
 static struct genl_family qdhcp_genl_family;
 static struct packet_type qdhcp_ptype;
 static bool ptype_registered;
+
+/* Char device global state */
+static struct miscdevice qdhcp_chardev;
+static bool chardev_registered;
+static LIST_HEAD(chardev_clients);
+static DEFINE_SPINLOCK(chardev_clients_lock);
+
+/* Forward declarations for chardev notification functions */
+static void qdhcp_chardev_notify_binding(const u8 *mac, __be32 ip, int ifindex,
+                                          u32 lease_time, u8 event_type);
+static void qdhcp_chardev_notify_iface(int ifindex, const char *ifname,
+                                        bool trusted, u8 event_type);
 
 /*
  * Multicast group for notifications
@@ -217,9 +300,12 @@ static int binding_add(struct qdhcp_priv *priv, const u8 *mac, __be32 ip,
         entry->lease_time = lease_time;
         entry->expire_time_ns = ktime_get_ns() + (u64)lease_time * NSEC_PER_SEC;
         spin_unlock_irqrestore(&priv->bind_lock, flags);
-        /* Notify even for updates */
+        /* Notify even for updates - via netlink and chardev */
         qdhcp_notify_binding_change(mac, ip, ifindex, lease_time,
                                     QDHCP_EVENT_BINDING_ADD);
+        if (chardev_registered)
+            qdhcp_chardev_notify_binding(mac, ip, ifindex, lease_time,
+                                         QDHCP_EVENT_BINDING_ADD);
         return 0;
     }
 
@@ -241,10 +327,14 @@ static int binding_add(struct qdhcp_priv *priv, const u8 *mac, __be32 ip,
 
     spin_unlock_irqrestore(&priv->bind_lock, flags);
 
-    /* Send notification for new binding */
-    if (is_new)
+    /* Send notification for new binding - via netlink and chardev */
+    if (is_new) {
         qdhcp_notify_binding_change(mac, ip, ifindex, lease_time,
                                     QDHCP_EVENT_BINDING_ADD);
+        if (chardev_registered)
+            qdhcp_chardev_notify_binding(mac, ip, ifindex, lease_time,
+                                         QDHCP_EVENT_BINDING_ADD);
+    }
     return 0;
 }
 
@@ -276,9 +366,12 @@ static int binding_del(struct qdhcp_priv *priv, const u8 *mac)
 
     kfree(entry);
 
-    /* Send notification */
+    /* Send notification - via netlink and chardev */
     qdhcp_notify_binding_change(mac, ip, ifindex, lease_time,
                                 QDHCP_EVENT_BINDING_DEL);
+    if (chardev_registered)
+        qdhcp_chardev_notify_binding(mac, ip, ifindex, lease_time,
+                                     QDHCP_EVENT_BINDING_DEL);
     return 0;
 }
 
@@ -358,9 +451,13 @@ static int iface_add(struct qdhcp_priv *priv, int ifindex, const char *name)
 
     pr_info("qdhcp: added interface %s (ifindex=%d)\n", name, ifindex);
 
-    /* Send notification */
-    if (is_new)
+    /* Send notification - via netlink and chardev */
+    if (is_new) {
         qdhcp_notify_iface_change(ifindex, name, false, QDHCP_EVENT_IFACE_ADD);
+        if (chardev_registered)
+            qdhcp_chardev_notify_iface(ifindex, name, false,
+                                       QDHCP_EVENT_IFACE_ADD);
+    }
 
     return 0;
 }
@@ -388,8 +485,11 @@ static int iface_del(struct qdhcp_priv *priv, int ifindex)
 
     spin_unlock_irqrestore(&priv->iface_lock, flags);
 
-    /* Send notification */
+    /* Send notification - via netlink and chardev */
     qdhcp_notify_iface_change(ifindex, ifname, trusted, QDHCP_EVENT_IFACE_DEL);
+    if (chardev_registered)
+        qdhcp_chardev_notify_iface(ifindex, ifname, trusted,
+                                   QDHCP_EVENT_IFACE_DEL);
 
     return 0;
 }
@@ -791,6 +891,701 @@ static void qdhcp_dev_setup(struct net_device *dev)
 }
 
 /*
+ * ==========================================================================
+ * Char Device Operations
+ * ==========================================================================
+ */
+
+/* Forward declaration for command processing */
+static int qdhcp_chardev_process_cmd(struct qdhcp_chardev_client *client,
+                                      const struct qdhcp_msg_hdr *hdr,
+                                      const u8 *payload, size_t payload_len,
+                                      u8 *resp_buf, size_t resp_buf_size);
+
+/*
+ * Queue a message to be delivered to subscribed clients
+ */
+static void qdhcp_chardev_queue_notification(const void *data, size_t len)
+{
+    struct qdhcp_chardev_client *client;
+    unsigned long flags;
+
+    spin_lock_irqsave(&chardev_clients_lock, flags);
+
+    list_for_each_entry(client, &chardev_clients, list) {
+        unsigned long client_flags;
+        struct qdhcp_queued_msg *msg;
+
+        spin_lock_irqsave(&client->lock, client_flags);
+
+        if (!client->subscribed) {
+            spin_unlock_irqrestore(&client->lock, client_flags);
+            continue;
+        }
+
+        /* Drop oldest if queue full */
+        if (client->queue_count >= QDHCP_CHARDEV_MSG_QUEUE_MAX) {
+            struct qdhcp_queued_msg *oldest;
+            oldest = list_first_entry(&client->msg_queue,
+                                       struct qdhcp_queued_msg, list);
+            list_del(&oldest->list);
+            kfree(oldest);
+            client->queue_count--;
+        }
+
+        /* Allocate and queue new message */
+        msg = kmalloc(sizeof(*msg) + len, GFP_ATOMIC);
+        if (msg) {
+            msg->len = len;
+            memcpy(msg->data, data, len);
+            list_add_tail(&msg->list, &client->msg_queue);
+            client->queue_count++;
+            wake_up_interruptible(&client->wait_queue);
+        }
+
+        spin_unlock_irqrestore(&client->lock, client_flags);
+    }
+
+    spin_unlock_irqrestore(&chardev_clients_lock, flags);
+}
+
+/*
+ * Build and queue a binding change notification
+ */
+static void qdhcp_chardev_notify_binding(const u8 *mac, __be32 ip, int ifindex,
+                                          u32 lease_time, u8 event_type)
+{
+    u8 buf[256];
+    struct qdhcp_msg_hdr *hdr = (struct qdhcp_msg_hdr *)buf;
+    u8 *ptr = buf + QDHCP_MSG_HDR_SIZE;
+    size_t payload_len = 0;
+    struct qdhcp_attr_hdr *attr;
+    size_t attr_space;
+
+    memset(hdr, 0, QDHCP_MSG_HDR_SIZE);
+    hdr->magic = QDHCP_MSG_MAGIC;
+    hdr->version = QDHCP_MSG_VERSION;
+    hdr->cmd = QDHCP_CMD_NOTIFY_BINDING;
+    hdr->flags = QDHCP_MSG_FLAG_NOTIFY;
+    hdr->seq = 0;
+    hdr->status = 0;
+
+    /* Add event type attribute */
+    attr = (struct qdhcp_attr_hdr *)ptr;
+    attr->type = QDHCP_ATTR_EVENT_TYPE;
+    attr->len = QDHCP_ATTR_HDR_SIZE + 1;
+    *(ptr + QDHCP_ATTR_HDR_SIZE) = event_type;
+    attr_space = QDHCP_ATTR_ALIGN(attr->len);
+    ptr += attr_space;
+    payload_len += attr_space;
+
+    /* Add MAC attribute */
+    attr = (struct qdhcp_attr_hdr *)ptr;
+    attr->type = QDHCP_ATTR_MAC;
+    attr->len = QDHCP_ATTR_HDR_SIZE + ETH_ALEN;
+    memcpy(ptr + QDHCP_ATTR_HDR_SIZE, mac, ETH_ALEN);
+    attr_space = QDHCP_ATTR_ALIGN(attr->len);
+    ptr += attr_space;
+    payload_len += attr_space;
+
+    /* Add IP attribute */
+    attr = (struct qdhcp_attr_hdr *)ptr;
+    attr->type = QDHCP_ATTR_IP;
+    attr->len = QDHCP_ATTR_HDR_SIZE + 4;
+    *(__u32 *)(ptr + QDHCP_ATTR_HDR_SIZE) = ntohl(ip);
+    attr_space = QDHCP_ATTR_ALIGN(attr->len);
+    ptr += attr_space;
+    payload_len += attr_space;
+
+    /* Add ifindex attribute */
+    attr = (struct qdhcp_attr_hdr *)ptr;
+    attr->type = QDHCP_ATTR_IFINDEX;
+    attr->len = QDHCP_ATTR_HDR_SIZE + 4;
+    *(__s32 *)(ptr + QDHCP_ATTR_HDR_SIZE) = ifindex;
+    attr_space = QDHCP_ATTR_ALIGN(attr->len);
+    ptr += attr_space;
+    payload_len += attr_space;
+
+    /* Add lease_time attribute */
+    attr = (struct qdhcp_attr_hdr *)ptr;
+    attr->type = QDHCP_ATTR_LEASE_TIME;
+    attr->len = QDHCP_ATTR_HDR_SIZE + 4;
+    *(__u32 *)(ptr + QDHCP_ATTR_HDR_SIZE) = lease_time;
+    attr_space = QDHCP_ATTR_ALIGN(attr->len);
+    ptr += attr_space;
+    payload_len += attr_space;
+
+    hdr->len = payload_len;
+
+    qdhcp_chardev_queue_notification(buf, QDHCP_MSG_HDR_SIZE + payload_len);
+}
+
+/*
+ * Build and queue an interface change notification
+ */
+static void qdhcp_chardev_notify_iface(int ifindex, const char *ifname,
+                                        bool trusted, u8 event_type)
+{
+    u8 buf[256];
+    struct qdhcp_msg_hdr *hdr = (struct qdhcp_msg_hdr *)buf;
+    u8 *ptr = buf + QDHCP_MSG_HDR_SIZE;
+    size_t payload_len = 0;
+    struct qdhcp_attr_hdr *attr;
+    size_t attr_space;
+    size_t name_len;
+
+    memset(hdr, 0, QDHCP_MSG_HDR_SIZE);
+    hdr->magic = QDHCP_MSG_MAGIC;
+    hdr->version = QDHCP_MSG_VERSION;
+    hdr->cmd = QDHCP_CMD_NOTIFY_IFACE;
+    hdr->flags = QDHCP_MSG_FLAG_NOTIFY;
+    hdr->seq = 0;
+    hdr->status = 0;
+
+    /* Add event type attribute */
+    attr = (struct qdhcp_attr_hdr *)ptr;
+    attr->type = QDHCP_ATTR_EVENT_TYPE;
+    attr->len = QDHCP_ATTR_HDR_SIZE + 1;
+    *(ptr + QDHCP_ATTR_HDR_SIZE) = event_type;
+    attr_space = QDHCP_ATTR_ALIGN(attr->len);
+    ptr += attr_space;
+    payload_len += attr_space;
+
+    /* Add ifindex attribute */
+    attr = (struct qdhcp_attr_hdr *)ptr;
+    attr->type = QDHCP_ATTR_IFINDEX;
+    attr->len = QDHCP_ATTR_HDR_SIZE + 4;
+    *(__s32 *)(ptr + QDHCP_ATTR_HDR_SIZE) = ifindex;
+    attr_space = QDHCP_ATTR_ALIGN(attr->len);
+    ptr += attr_space;
+    payload_len += attr_space;
+
+    /* Add ifname attribute */
+    if (ifname && ifname[0]) {
+        name_len = strlen(ifname) + 1;
+        attr = (struct qdhcp_attr_hdr *)ptr;
+        attr->type = QDHCP_ATTR_IFNAME;
+        attr->len = QDHCP_ATTR_HDR_SIZE + name_len;
+        memcpy(ptr + QDHCP_ATTR_HDR_SIZE, ifname, name_len);
+        attr_space = QDHCP_ATTR_ALIGN(attr->len);
+        ptr += attr_space;
+        payload_len += attr_space;
+    }
+
+    /* Add trusted attribute */
+    attr = (struct qdhcp_attr_hdr *)ptr;
+    attr->type = QDHCP_ATTR_TRUSTED;
+    attr->len = QDHCP_ATTR_HDR_SIZE + 1;
+    *(ptr + QDHCP_ATTR_HDR_SIZE) = trusted ? 1 : 0;
+    attr_space = QDHCP_ATTR_ALIGN(attr->len);
+    ptr += attr_space;
+    payload_len += attr_space;
+
+    hdr->len = payload_len;
+
+    qdhcp_chardev_queue_notification(buf, QDHCP_MSG_HDR_SIZE + payload_len);
+}
+
+/*
+ * Parse attributes from message payload
+ */
+static int qdhcp_chardev_find_attr(const u8 *payload, size_t len,
+                                    u16 type, void **data, size_t *data_len)
+{
+    const u8 *ptr = payload;
+    size_t remaining = len;
+
+    while (remaining >= QDHCP_ATTR_HDR_SIZE) {
+        const struct qdhcp_attr_hdr *attr = (const struct qdhcp_attr_hdr *)ptr;
+        size_t padded_len = QDHCP_ATTR_ALIGN(attr->len);
+
+        if (attr->len < QDHCP_ATTR_HDR_SIZE || padded_len > remaining)
+            break;
+
+        if (attr->type == type) {
+            *data = (void *)(ptr + QDHCP_ATTR_HDR_SIZE);
+            *data_len = attr->len - QDHCP_ATTR_HDR_SIZE;
+            return 0;
+        }
+
+        ptr += padded_len;
+        remaining -= padded_len;
+    }
+
+    return -ENOENT;
+}
+
+/*
+ * Process a command from char device client
+ */
+static int qdhcp_chardev_process_cmd(struct qdhcp_chardev_client *client,
+                                      const struct qdhcp_msg_hdr *hdr,
+                                      const u8 *payload, size_t payload_len,
+                                      u8 *resp_buf, size_t resp_buf_size)
+{
+    struct qdhcp_priv *priv;
+    struct qdhcp_msg_hdr *resp_hdr;
+    int ret = 0;
+    void *data;
+    size_t data_len;
+
+    if (!qdhcp_netdev)
+        return -ENODEV;
+
+    priv = netdev_priv(qdhcp_netdev);
+    resp_hdr = (struct qdhcp_msg_hdr *)resp_buf;
+
+    /* Build response header */
+    memset(resp_hdr, 0, QDHCP_MSG_HDR_SIZE);
+    resp_hdr->magic = QDHCP_MSG_MAGIC;
+    resp_hdr->version = QDHCP_MSG_VERSION;
+    resp_hdr->cmd = hdr->cmd;
+    resp_hdr->flags = QDHCP_MSG_FLAG_RESPONSE;
+    resp_hdr->seq = hdr->seq;
+    resp_hdr->len = 0;
+    resp_hdr->status = 0;
+
+    switch (hdr->cmd) {
+    case QDHCP_CMD_REGISTER:
+        spin_lock(&priv->lock);
+        priv->daemon_registered = true;
+        spin_unlock(&priv->lock);
+        pr_info("qdhcp: daemon registered (chardev)\n");
+        break;
+
+    case QDHCP_CMD_UNREGISTER:
+        spin_lock(&priv->lock);
+        priv->daemon_registered = false;
+        spin_unlock(&priv->lock);
+        pr_info("qdhcp: daemon unregistered (chardev)\n");
+        break;
+
+    case QDHCP_CMD_ADD_INTERFACE: {
+        __s32 ifindex = 0;
+        char ifname[IFNAMSIZ] = {0};
+
+        if (qdhcp_chardev_find_attr(payload, payload_len,
+                                     QDHCP_ATTR_IFINDEX, &data, &data_len) == 0 &&
+            data_len >= sizeof(__s32)) {
+            ifindex = *(__s32 *)data;
+        } else {
+            ret = -EINVAL;
+            break;
+        }
+
+        if (qdhcp_chardev_find_attr(payload, payload_len,
+                                     QDHCP_ATTR_IFNAME, &data, &data_len) == 0) {
+            strscpy(ifname, data, min(data_len + 1, (size_t)IFNAMSIZ));
+        }
+
+        ret = iface_add(priv, ifindex, ifname);
+        break;
+    }
+
+    case QDHCP_CMD_DEL_INTERFACE: {
+        __s32 ifindex = 0;
+
+        if (qdhcp_chardev_find_attr(payload, payload_len,
+                                     QDHCP_ATTR_IFINDEX, &data, &data_len) == 0 &&
+            data_len >= sizeof(__s32)) {
+            ifindex = *(__s32 *)data;
+        } else {
+            ret = -EINVAL;
+            break;
+        }
+
+        ret = iface_del(priv, ifindex);
+        break;
+    }
+
+    case QDHCP_CMD_SET_TRUSTED: {
+        __s32 ifindex = 0;
+        u8 trusted = 0;
+        struct monitored_iface *iface;
+        unsigned long flags;
+
+        if (qdhcp_chardev_find_attr(payload, payload_len,
+                                     QDHCP_ATTR_IFINDEX, &data, &data_len) == 0 &&
+            data_len >= sizeof(__s32)) {
+            ifindex = *(__s32 *)data;
+        } else {
+            ret = -EINVAL;
+            break;
+        }
+
+        if (qdhcp_chardev_find_attr(payload, payload_len,
+                                     QDHCP_ATTR_TRUSTED, &data, &data_len) == 0 &&
+            data_len >= 1) {
+            trusted = *(u8 *)data;
+        }
+
+        spin_lock_irqsave(&priv->iface_lock, flags);
+        iface = iface_find(priv, ifindex);
+        if (!iface) {
+            spin_unlock_irqrestore(&priv->iface_lock, flags);
+            ret = -ENOENT;
+            break;
+        }
+        iface->trusted = trusted ? true : false;
+        spin_unlock_irqrestore(&priv->iface_lock, flags);
+        break;
+    }
+
+    case QDHCP_CMD_ADD_BINDING: {
+        u8 mac[ETH_ALEN];
+        __be32 ip = 0;
+        __s32 ifindex = 0;
+        __u32 lease_time = 3600;
+
+        if (qdhcp_chardev_find_attr(payload, payload_len,
+                                     QDHCP_ATTR_MAC, &data, &data_len) == 0 &&
+            data_len >= ETH_ALEN) {
+            memcpy(mac, data, ETH_ALEN);
+        } else {
+            ret = -EINVAL;
+            break;
+        }
+
+        if (qdhcp_chardev_find_attr(payload, payload_len,
+                                     QDHCP_ATTR_IP, &data, &data_len) == 0 &&
+            data_len >= sizeof(__u32)) {
+            ip = htonl(*(__u32 *)data);
+        } else {
+            ret = -EINVAL;
+            break;
+        }
+
+        if (qdhcp_chardev_find_attr(payload, payload_len,
+                                     QDHCP_ATTR_IFINDEX, &data, &data_len) == 0 &&
+            data_len >= sizeof(__s32)) {
+            ifindex = *(__s32 *)data;
+        }
+
+        if (qdhcp_chardev_find_attr(payload, payload_len,
+                                     QDHCP_ATTR_LEASE_TIME, &data, &data_len) == 0 &&
+            data_len >= sizeof(__u32)) {
+            lease_time = *(__u32 *)data;
+        }
+
+        ret = binding_add(priv, mac, ip, ifindex, lease_time);
+        break;
+    }
+
+    case QDHCP_CMD_DEL_BINDING: {
+        u8 mac[ETH_ALEN];
+
+        if (qdhcp_chardev_find_attr(payload, payload_len,
+                                     QDHCP_ATTR_MAC, &data, &data_len) == 0 &&
+            data_len >= ETH_ALEN) {
+            memcpy(mac, data, ETH_ALEN);
+        } else {
+            ret = -EINVAL;
+            break;
+        }
+
+        ret = binding_del(priv, mac);
+        break;
+    }
+
+    case QDHCP_CMD_CLEAR_BINDINGS:
+        binding_clear_all(priv);
+        break;
+
+    case QDHCP_CMD_SET_METHOD: {
+        u8 method = 0;
+
+        if (qdhcp_chardev_find_attr(payload, payload_len,
+                                     QDHCP_ATTR_METHOD, &data, &data_len) == 0 &&
+            data_len >= 1) {
+            method = *(u8 *)data;
+        } else {
+            ret = -EINVAL;
+            break;
+        }
+
+        priv->method = method;
+        pr_info("qdhcp: method set to 0x%02x (chardev)\n", method);
+        break;
+    }
+
+    case QDHCP_CMD_GET_STATS: {
+        struct qdhcp_stats stats;
+        struct qdhcp_attr_hdr *attr;
+        u8 *ptr;
+
+        spin_lock(&priv->lock);
+        memcpy(&stats, &priv->stats, sizeof(stats));
+        stats.binding_count = priv->bind_count;
+        spin_unlock(&priv->lock);
+
+        /* Add stats attribute to response */
+        ptr = resp_buf + QDHCP_MSG_HDR_SIZE;
+        attr = (struct qdhcp_attr_hdr *)ptr;
+        attr->type = QDHCP_ATTR_STATS;
+        attr->len = QDHCP_ATTR_HDR_SIZE + sizeof(stats);
+        memcpy(ptr + QDHCP_ATTR_HDR_SIZE, &stats, sizeof(stats));
+        resp_hdr->len = QDHCP_ATTR_ALIGN(attr->len);
+        break;
+    }
+
+    default:
+        ret = -EOPNOTSUPP;
+        break;
+    }
+
+    if (ret < 0) {
+        resp_hdr->flags |= QDHCP_MSG_FLAG_ERROR;
+        resp_hdr->status = ret;
+    }
+
+    return QDHCP_MSG_HDR_SIZE + resp_hdr->len;
+}
+
+/*
+ * Char device file operations
+ */
+static int qdhcp_chardev_open(struct inode *inode, struct file *filp)
+{
+    struct qdhcp_chardev_client *client;
+    unsigned long flags;
+
+    client = kzalloc(sizeof(*client), GFP_KERNEL);
+    if (!client)
+        return -ENOMEM;
+
+    spin_lock_init(&client->lock);
+    INIT_LIST_HEAD(&client->msg_queue);
+    init_waitqueue_head(&client->wait_queue);
+
+    spin_lock_irqsave(&chardev_clients_lock, flags);
+    list_add(&client->list, &chardev_clients);
+    spin_unlock_irqrestore(&chardev_clients_lock, flags);
+
+    filp->private_data = client;
+    pr_debug("qdhcp: chardev opened\n");
+    return 0;
+}
+
+static int qdhcp_chardev_release(struct inode *inode, struct file *filp)
+{
+    struct qdhcp_chardev_client *client = filp->private_data;
+    struct qdhcp_queued_msg *msg, *tmp;
+    unsigned long flags;
+
+    if (!client)
+        return 0;
+
+    spin_lock_irqsave(&chardev_clients_lock, flags);
+    list_del(&client->list);
+    spin_unlock_irqrestore(&chardev_clients_lock, flags);
+
+    /* Free queued messages */
+    spin_lock_irqsave(&client->lock, flags);
+    list_for_each_entry_safe(msg, tmp, &client->msg_queue, list) {
+        list_del(&msg->list);
+        kfree(msg);
+    }
+    spin_unlock_irqrestore(&client->lock, flags);
+
+    kfree(client);
+    pr_debug("qdhcp: chardev closed\n");
+    return 0;
+}
+
+static ssize_t qdhcp_chardev_read(struct file *filp, char __user *buf,
+                                   size_t count, loff_t *ppos)
+{
+    struct qdhcp_chardev_client *client = filp->private_data;
+    struct qdhcp_queued_msg *msg;
+    unsigned long flags;
+    ssize_t ret;
+
+    if (!client)
+        return -EINVAL;
+
+    /* Wait for message if blocking */
+    if (list_empty(&client->msg_queue)) {
+        if (filp->f_flags & O_NONBLOCK)
+            return -EAGAIN;
+
+        ret = wait_event_interruptible(client->wait_queue,
+                                        !list_empty(&client->msg_queue));
+        if (ret)
+            return ret;
+    }
+
+    spin_lock_irqsave(&client->lock, flags);
+
+    if (list_empty(&client->msg_queue)) {
+        spin_unlock_irqrestore(&client->lock, flags);
+        return -EAGAIN;
+    }
+
+    msg = list_first_entry(&client->msg_queue, struct qdhcp_queued_msg, list);
+
+    if (count < msg->len) {
+        spin_unlock_irqrestore(&client->lock, flags);
+        return -EINVAL;
+    }
+
+    list_del(&msg->list);
+    client->queue_count--;
+
+    spin_unlock_irqrestore(&client->lock, flags);
+
+    ret = msg->len;
+    if (copy_to_user(buf, msg->data, msg->len))
+        ret = -EFAULT;
+
+    kfree(msg);
+    return ret;
+}
+
+static ssize_t qdhcp_chardev_write(struct file *filp, const char __user *buf,
+                                    size_t count, loff_t *ppos)
+{
+    struct qdhcp_chardev_client *client = filp->private_data;
+    u8 *msg_buf = NULL;
+    u8 *resp_buf = NULL;
+    struct qdhcp_msg_hdr *hdr;
+    struct qdhcp_queued_msg *resp_msg;
+    unsigned long flags;
+    ssize_t ret;
+    int resp_len;
+
+    if (!client)
+        return -EINVAL;
+
+    if (count < QDHCP_MSG_HDR_SIZE || count > QDHCP_CHARDEV_MSG_MAX_SIZE)
+        return -EINVAL;
+
+    msg_buf = kmalloc(count, GFP_KERNEL);
+    resp_buf = kmalloc(QDHCP_CHARDEV_MSG_MAX_SIZE, GFP_KERNEL);
+
+    if (!msg_buf || !resp_buf) {
+        ret = -ENOMEM;
+        goto out;
+    }
+
+    if (copy_from_user(msg_buf, buf, count)) {
+        ret = -EFAULT;
+        goto out;
+    }
+
+    hdr = (struct qdhcp_msg_hdr *)msg_buf;
+
+    /* Validate message */
+    if (hdr->magic != QDHCP_MSG_MAGIC || hdr->version != QDHCP_MSG_VERSION) {
+        ret = -EPROTO;
+        goto out;
+    }
+
+    if (QDHCP_MSG_HDR_SIZE + hdr->len > count) {
+        ret = -EINVAL;
+        goto out;
+    }
+
+    /* Process command */
+    resp_len = qdhcp_chardev_process_cmd(client, hdr,
+                                          msg_buf + QDHCP_MSG_HDR_SIZE, hdr->len,
+                                          resp_buf, QDHCP_CHARDEV_MSG_MAX_SIZE);
+
+    if (resp_len < 0) {
+        ret = resp_len;
+        goto out;
+    }
+
+    /* Queue response if ACK requested */
+    if (hdr->flags & QDHCP_MSG_FLAG_ACK) {
+        resp_msg = kmalloc(sizeof(*resp_msg) + resp_len, GFP_KERNEL);
+        if (!resp_msg) {
+            ret = -ENOMEM;
+            goto out;
+        }
+
+        resp_msg->len = resp_len;
+        memcpy(resp_msg->data, resp_buf, resp_len);
+
+        spin_lock_irqsave(&client->lock, flags);
+        list_add_tail(&resp_msg->list, &client->msg_queue);
+        client->queue_count++;
+        spin_unlock_irqrestore(&client->lock, flags);
+
+        wake_up_interruptible(&client->wait_queue);
+    }
+
+    ret = count;
+
+out:
+    kfree(msg_buf);
+    kfree(resp_buf);
+    return ret;
+}
+
+static __poll_t qdhcp_chardev_poll(struct file *filp,
+                                    struct poll_table_struct *wait)
+{
+    struct qdhcp_chardev_client *client = filp->private_data;
+    __poll_t mask = 0;
+    unsigned long flags;
+
+    if (!client)
+        return POLLERR;
+
+    poll_wait(filp, &client->wait_queue, wait);
+
+    spin_lock_irqsave(&client->lock, flags);
+    if (!list_empty(&client->msg_queue))
+        mask |= POLLIN | POLLRDNORM;
+    spin_unlock_irqrestore(&client->lock, flags);
+
+    /* Always writable */
+    mask |= POLLOUT | POLLWRNORM;
+
+    return mask;
+}
+
+static long qdhcp_chardev_ioctl(struct file *filp, unsigned int cmd,
+                                 unsigned long arg)
+{
+    struct qdhcp_chardev_client *client = filp->private_data;
+    unsigned long flags;
+
+    if (!client)
+        return -EINVAL;
+
+    switch (cmd) {
+    case QDHCP_IOC_SUBSCRIBE:
+        spin_lock_irqsave(&client->lock, flags);
+        client->subscribed = true;
+        spin_unlock_irqrestore(&client->lock, flags);
+        pr_debug("qdhcp: chardev client subscribed\n");
+        return 0;
+
+    case QDHCP_IOC_UNSUBSCRIBE:
+        spin_lock_irqsave(&client->lock, flags);
+        client->subscribed = false;
+        spin_unlock_irqrestore(&client->lock, flags);
+        pr_debug("qdhcp: chardev client unsubscribed\n");
+        return 0;
+
+    default:
+        return -ENOTTY;
+    }
+}
+
+static const struct file_operations qdhcp_chardev_fops = {
+    .owner          = THIS_MODULE,
+    .open           = qdhcp_chardev_open,
+    .release        = qdhcp_chardev_release,
+    .read           = qdhcp_chardev_read,
+    .write          = qdhcp_chardev_write,
+    .poll           = qdhcp_chardev_poll,
+    .unlocked_ioctl = qdhcp_chardev_ioctl,
+    .compat_ioctl   = qdhcp_chardev_ioctl,
+};
+
+/*
  * Netlink attribute policy
  */
 static struct nla_policy qdhcp_genl_policy[__QDHCP_ATTR_MAX] = {
@@ -1076,6 +1871,21 @@ static int __init qdhcp_init(void)
             pr_info("qdhcp: TC classifier registered\n");
     }
 
+    /* Register char device for alternative transport */
+    qdhcp_chardev.minor = MISC_DYNAMIC_MINOR;
+    qdhcp_chardev.name = QDHCP_CHARDEV_NAME;
+    qdhcp_chardev.fops = &qdhcp_chardev_fops;
+    qdhcp_chardev.mode = 0666;
+
+    ret = misc_register(&qdhcp_chardev);
+    if (ret < 0) {
+        pr_warn("qdhcp: misc_register failed: %d\n", ret);
+        /* Non-fatal - continue without chardev */
+    } else {
+        chardev_registered = true;
+        pr_info("qdhcp: char device %s registered\n", QDHCP_CHARDEV_NAME);
+    }
+
     pr_info("qdhcp: loaded, device %s created\n", QDHCP_DEV_NAME);
     return 0;
 }
@@ -1083,6 +1893,13 @@ static int __init qdhcp_init(void)
 static void __exit qdhcp_exit(void)
 {
     struct qdhcp_priv *priv;
+
+    /* Unregister char device */
+    if (chardev_registered) {
+        misc_deregister(&qdhcp_chardev);
+        chardev_registered = false;
+        pr_info("qdhcp: char device unregistered\n");
+    }
 
     if (intercept_method & QDHCP_METHOD_TC_INGRESS)
         unregister_tcf_proto_ops(&qdhcp_tc_ops);

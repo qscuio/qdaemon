@@ -39,7 +39,7 @@
 #include "dhcp_lease.h"
 #include "dhcp_ipc.h"
 #include "dhcp_kmod.h"
-#include "qd_dhcp_nl.h"
+#include "qd_dhcp_msg.h"
 
 /*
  * Daemon Context
@@ -48,7 +48,7 @@ typedef struct {
     /* Framework components */
     qd_daemon_t        *daemon;
     qd_event_loop_t    *loop;
-    qd_dhcp_nl_t       *dhcp_nl;       /* DHCP netlink wrapper */
+    qd_dhcp_conn_t     *kmod_conn;     /* Kernel module connection */
 
     /* Raw socket for packet I/O on qdhcp0 */
     int                 raw_sock;
@@ -328,90 +328,90 @@ static const qd_handler_entry_t ipc_handler_entries[] = {
 };
 
 /*
- * Netlink Notification Handlers
+ * Kernel Module Notification Handlers
  */
 
-static qd_dhcp_nl_handler_result_t on_binding_add(qd_dhcp_nl_ctx_t *ctx, void *arg)
+static qd_dhcp_handler_result_t on_binding_add(qd_dhcp_msg_ctx_t *ctx, void *arg)
 {
     (void)arg;
     const qd_dhcp_binding_t *b = ctx->binding;
-    if (!b) return QD_DHCP_NL_HANDLER_ERROR;
+    if (!b) return QD_DHCP_HANDLER_ERROR;
 
     char mac_str[18], ip_str[16];
-    qd_dhcp_nl_mac_str(b->mac, mac_str, sizeof(mac_str));
-    qd_dhcp_nl_ip_str(b->ip, ip_str, sizeof(ip_str));
+    qd_dhcp_mac_str(b->mac, mac_str, sizeof(mac_str));
+    qd_dhcp_ip_str(b->ip, ip_str, sizeof(ip_str));
 
     qd_log_info("Kernel binding added: %s -> %s (ifindex=%d, lease=%u)",
                 mac_str, ip_str, b->ifindex, b->lease_time);
 
-    return QD_DHCP_NL_HANDLER_OK;
+    return QD_DHCP_HANDLER_OK;
 }
 
-static qd_dhcp_nl_handler_result_t on_binding_del(qd_dhcp_nl_ctx_t *ctx, void *arg)
+static qd_dhcp_handler_result_t on_binding_del(qd_dhcp_msg_ctx_t *ctx, void *arg)
 {
     (void)arg;
     const qd_dhcp_binding_t *b = ctx->binding;
-    if (!b) return QD_DHCP_NL_HANDLER_ERROR;
+    if (!b) return QD_DHCP_HANDLER_ERROR;
 
     char mac_str[18], ip_str[16];
-    qd_dhcp_nl_mac_str(b->mac, mac_str, sizeof(mac_str));
-    qd_dhcp_nl_ip_str(b->ip, ip_str, sizeof(ip_str));
+    qd_dhcp_mac_str(b->mac, mac_str, sizeof(mac_str));
+    qd_dhcp_ip_str(b->ip, ip_str, sizeof(ip_str));
 
     qd_log_info("Kernel binding removed: %s -> %s", mac_str, ip_str);
 
-    return QD_DHCP_NL_HANDLER_OK;
+    return QD_DHCP_HANDLER_OK;
 }
 
-static qd_dhcp_nl_handler_result_t on_iface_add(qd_dhcp_nl_ctx_t *ctx, void *arg)
+static qd_dhcp_handler_result_t on_iface_add(qd_dhcp_msg_ctx_t *ctx, void *arg)
 {
     (void)arg;
     const qd_dhcp_iface_t *iface = ctx->iface;
-    if (!iface) return QD_DHCP_NL_HANDLER_ERROR;
+    if (!iface) return QD_DHCP_HANDLER_ERROR;
 
     qd_log_info("Kernel interface added: %s (ifindex=%d, trusted=%d)",
                 iface->ifname, iface->ifindex, iface->trusted);
 
-    return QD_DHCP_NL_HANDLER_OK;
+    return QD_DHCP_HANDLER_OK;
 }
 
-static qd_dhcp_nl_handler_result_t on_iface_del(qd_dhcp_nl_ctx_t *ctx, void *arg)
+static qd_dhcp_handler_result_t on_iface_del(qd_dhcp_msg_ctx_t *ctx, void *arg)
 {
     (void)arg;
     const qd_dhcp_iface_t *iface = ctx->iface;
-    if (!iface) return QD_DHCP_NL_HANDLER_ERROR;
+    if (!iface) return QD_DHCP_HANDLER_ERROR;
 
     qd_log_info("Kernel interface removed: %s (ifindex=%d)",
                 iface->ifname, iface->ifindex);
 
-    return QD_DHCP_NL_HANDLER_OK;
+    return QD_DHCP_HANDLER_OK;
 }
 
 /*
  * Dispatch notification based on event type
  */
-static qd_dhcp_nl_handler_result_t on_binding_notify(qd_dhcp_nl_ctx_t *ctx, void *arg)
+static qd_dhcp_handler_result_t on_binding_notify(qd_dhcp_msg_ctx_t *ctx, void *arg)
 {
     if (ctx->event == QD_DHCP_EVENT_BINDING_ADD)
         return on_binding_add(ctx, arg);
     else if (ctx->event == QD_DHCP_EVENT_BINDING_DEL)
         return on_binding_del(ctx, arg);
-    return QD_DHCP_NL_HANDLER_OK;
+    return QD_DHCP_HANDLER_OK;
 }
 
-static qd_dhcp_nl_handler_result_t on_iface_notify(qd_dhcp_nl_ctx_t *ctx, void *arg)
+static qd_dhcp_handler_result_t on_iface_notify(qd_dhcp_msg_ctx_t *ctx, void *arg)
 {
     if (ctx->event == QD_DHCP_EVENT_IFACE_ADD)
         return on_iface_add(ctx, arg);
     else if (ctx->event == QD_DHCP_EVENT_IFACE_DEL)
         return on_iface_del(ctx, arg);
-    return QD_DHCP_NL_HANDLER_OK;
+    return QD_DHCP_HANDLER_OK;
 }
 
-/* Netlink notification handler table */
-static const qd_dhcp_nl_handler_entry_t nl_handler_entries[] = {
-    QD_DHCP_NL_HANDLER(QD_DHCP_CMD_NOTIFY_BINDING, on_binding_notify),
-    QD_DHCP_NL_HANDLER(QD_DHCP_CMD_NOTIFY_IFACE, on_iface_notify),
-    QD_DHCP_NL_HANDLER_END()
+/* Kernel module notification handler table */
+static const qd_dhcp_handler_entry_t kmod_handler_entries[] = {
+    QD_DHCP_HANDLER(QD_DHCP_CMD_NOTIFY_BINDING, on_binding_notify),
+    QD_DHCP_HANDLER(QD_DHCP_CMD_NOTIFY_IFACE, on_iface_notify),
+    QD_DHCP_HANDLER_END()
 };
 
 /*
@@ -824,32 +824,32 @@ static int on_init(qd_daemon_t *daemon, void *arg)
     qd_event_add(g_dhcpd.loop, g_dhcpd.raw_sock, QD_EVENT_READ,
                  on_raw_socket_readable, NULL);
 
-    /* Connect to kernel module via netlink wrapper API */
-    g_dhcpd.dhcp_nl = qd_dhcp_nl_create();
-    if (!g_dhcpd.dhcp_nl) {
-        qd_log_warn("DHCP netlink connection failed - control commands unavailable");
+    /* Connect to kernel module via transport-agnostic messaging API */
+    g_dhcpd.kmod_conn = qd_dhcp_connect(NULL);  /* Use default config */
+    if (!g_dhcpd.kmod_conn) {
+        qd_log_warn("Kernel module connection failed - control commands unavailable");
         /* Continue anyway - raw socket is sufficient for basic operation */
     } else {
         /* Set user data for handlers */
-        qd_dhcp_nl_set_user_data(g_dhcpd.dhcp_nl, &g_dhcpd);
+        qd_dhcp_set_user_data(g_dhcpd.kmod_conn, &g_dhcpd);
 
         /* Register notification handlers */
-        if (qd_dhcp_nl_register_handlers(g_dhcpd.dhcp_nl, nl_handler_entries) != QD_DHCP_NL_OK) {
-            qd_log_warn("Failed to register netlink handlers");
+        if (qd_dhcp_register_handlers(g_dhcpd.kmod_conn, kmod_handler_entries) != QD_DHCP_OK) {
+            qd_log_warn("Failed to register kernel module handlers");
         }
 
         /* Attach to event loop */
-        if (qd_dhcp_nl_attach(g_dhcpd.dhcp_nl, g_dhcpd.loop) != QD_DHCP_NL_OK) {
-            qd_log_warn("Failed to attach netlink to event loop");
+        if (qd_dhcp_attach(g_dhcpd.kmod_conn, g_dhcpd.loop) != QD_DHCP_OK) {
+            qd_log_warn("Failed to attach to event loop");
         }
 
         /* Subscribe to kernel notifications */
-        if (qd_dhcp_nl_subscribe(g_dhcpd.dhcp_nl) != QD_DHCP_NL_OK) {
+        if (qd_dhcp_subscribe(g_dhcpd.kmod_conn) != QD_DHCP_OK) {
             qd_log_debug("Multicast subscription not available");
         }
 
         /* Register daemon with kernel */
-        if (qd_dhcp_nl_register(g_dhcpd.dhcp_nl) != QD_DHCP_NL_OK) {
+        if (qd_dhcp_register(g_dhcpd.kmod_conn) != QD_DHCP_OK) {
             qd_log_warn("Failed to register with kernel module");
         }
     }
@@ -903,11 +903,11 @@ static void on_shutdown(qd_daemon_t *daemon, void *arg)
     if (g_dhcpd.ipc_handlers)
         qd_handler_table_destroy(g_dhcpd.ipc_handlers);
 
-    /* Unregister from kernel via netlink wrapper */
-    if (g_dhcpd.dhcp_nl) {
-        qd_dhcp_nl_unregister(g_dhcpd.dhcp_nl);
-        qd_dhcp_nl_destroy(g_dhcpd.dhcp_nl);
-        g_dhcpd.dhcp_nl = NULL;
+    /* Unregister from kernel via messaging API */
+    if (g_dhcpd.kmod_conn) {
+        qd_dhcp_unregister(g_dhcpd.kmod_conn);
+        qd_dhcp_disconnect(g_dhcpd.kmod_conn);
+        g_dhcpd.kmod_conn = NULL;
     }
 
     /* Destroy DHCP components */

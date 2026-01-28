@@ -14,9 +14,11 @@
 #endif
 
 /*
- * Device name
+ * Device names
  */
-#define QDHCP_DEV_NAME      "qdhcp0"
+#define QDHCP_DEV_NAME      "qdhcp0"        /* Virtual netdev for packet I/O */
+#define QDHCP_CHARDEV_NAME  "qdhcp_ctl"     /* Char device for control messages */
+#define QDHCP_CHARDEV_PATH  "/dev/qdhcp_ctl"
 
 /*
  * Metadata magic number for validation
