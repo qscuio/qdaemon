@@ -10,7 +10,7 @@ TESTDIR = tests
 
 CC ?= gcc
 AR ?= ar
-CFLAGS = -Wall -Wextra -Werror -std=c11 -D_GNU_SOURCE
+CFLAGS = -Wall -Wextra -Werror -std=gnu11 -D_GNU_SOURCE
 CFLAGS += -Iinclude -Isrc/util -Isrc/cint
 LDFLAGS = -lpthread -lrt -lreadline -lm 
 LDFLAGS += -L$(BUILDDIR) -Wl,-rpath,'$$ORIGIN'
@@ -116,7 +116,10 @@ DHCP_SRCS = $(EXAMPLEDIR)/dhcp/src/qd_dhcpd.c \
             $(EXAMPLEDIR)/dhcp/src/dhcp_lease.c \
             $(EXAMPLEDIR)/dhcp/src/dhcp_server.c \
             $(EXAMPLEDIR)/dhcp/src/dhcp_relay.c \
-            $(EXAMPLEDIR)/dhcp/src/dhcp_rest.c
+            $(EXAMPLEDIR)/dhcp/src/dhcp_rest.c \
+            $(EXAMPLEDIR)/dhcp/src/dhcp_core.c \
+            $(EXAMPLEDIR)/dhcp/src/dhcp_storage_file.c \
+            $(EXAMPLEDIR)/dhcp/src/qd_dhcp_msg.c
 
 $(BUILDDIR)/qd_dhcpd: $(DHCP_SRCS) $(LIB_STATIC)
 	$(CC) $(CFLAGS) -I$(EXAMPLEDIR)/dhcp/include $(DHCP_SRCS) -o $@ -L$(BUILDDIR) -lqdaemon $(LDFLAGS)

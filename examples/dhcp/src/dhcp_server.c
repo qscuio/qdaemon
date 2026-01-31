@@ -14,6 +14,7 @@
 #endif
 
 #include "dhcp_server.h"
+#include "dhcp_core.h"
 
 /*
  * Server Context
@@ -43,6 +44,9 @@ struct dhcp_server {
 
     /* Server MAC (for responses) */
     uint8_t server_mac[6];
+
+    /* Optional: Core context for plugin/storage integration */
+    dhcp_core_t *core;
 };
 
 /*
@@ -797,4 +801,36 @@ int dhcp_server_load_leases(dhcp_server_t *server)
     if (!server || !server->config.lease_file)
         return -1;
     return dhcp_lease_db_load(server->lease_db, server->config.lease_file);
+}
+
+/*
+ * Core Integration (Optional)
+ * Allows connecting server to dhcp_core_t for plugin/storage integration
+ */
+
+int dhcp_server_set_core(dhcp_server_t *server, dhcp_core_t *core)
+{
+    if (!server)
+        return -1;
+    server->core = core;
+    return 0;
+}
+
+dhcp_core_t *dhcp_server_get_core(dhcp_server_t *server)
+{
+    if (!server)
+        return NULL;
+    return server->core;
+}
+
+/*
+ * Dispatch hook via core (if attached)
+ * Returns 0 if no hook registered or hooks allow processing
+ * Returns non-zero to stop packet processing
+ */
+int dhcp_server_dispatch_hook(dhcp_server_t *server, dhcp_hook_type_t type, void *data)
+{
+    if (!server || !server->core)
+        return 0;  /* No core attached, continue processing */
+    return dhcp_core_dispatch_hook(server->core, type, data);
 }

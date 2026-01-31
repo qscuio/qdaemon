@@ -36,6 +36,49 @@ typedef struct qd_event_loop qd_event_loop_t;
 typedef struct qd_netlink qd_netlink_t;
 typedef struct qd_handler_table qd_handler_table_t;
 
+/*
+ * Simple hash table implementation for standalone mode
+ */
+typedef struct qd_hash_s {
+    void **buckets;
+    size_t bucket_count;
+    size_t count;
+} qd_hash_t;
+
+qd_hash_t *qd_hash_create(size_t bucket_count);
+void qd_hash_destroy(qd_hash_t *h, void (*free_fn)(void *));
+int qd_hash_insert(qd_hash_t *h, const void *key, size_t key_len, void *value);
+void *qd_hash_lookup(qd_hash_t *h, const void *key, size_t key_len);
+int qd_hash_remove(qd_hash_t *h, const void *key, size_t key_len);
+typedef int (*qd_hash_iter_fn)(const void *key, size_t key_len, void *value, void *arg);
+void qd_hash_iterate(qd_hash_t *h, qd_hash_iter_fn fn, void *arg);
+
+/*
+ * Simple linked list implementation for standalone mode
+ */
+typedef struct qd_list_node_s {
+    void *data;
+    struct qd_list_node_s *next;
+    struct qd_list_node_s *prev;
+} qd_list_node_t;
+
+typedef struct qd_list_s {
+    qd_list_node_t *head;
+    qd_list_node_t *tail;
+    size_t count;
+} qd_list_t;
+
+qd_list_t *qd_list_create(void);
+void qd_list_destroy(qd_list_t *l, void (*free_fn)(void *));
+int qd_list_append(qd_list_t *l, void *data);
+int qd_list_prepend(qd_list_t *l, void *data);
+void *qd_list_remove(qd_list_t *l, void *data);
+void *qd_list_pop_front(qd_list_t *l);
+void *qd_list_pop_back(qd_list_t *l);
+size_t qd_list_count(qd_list_t *l);
+typedef int (*qd_list_iter_fn)(void *data, void *arg);
+void qd_list_iterate(qd_list_t *l, qd_list_iter_fn fn, void *arg);
+
 /* Netlink message - needs to be defined for local variable usage */
 typedef struct qd_netlink_msg {
     int cmd;

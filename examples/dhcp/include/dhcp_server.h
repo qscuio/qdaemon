@@ -131,6 +131,16 @@ void dhcp_server_reset_stats(dhcp_server_t *server);
 int dhcp_server_save_leases(dhcp_server_t *server);
 int dhcp_server_load_leases(dhcp_server_t *server);
 
+/*
+ * Core Integration (Optional)
+ * Connect server to dhcp_core_t for plugin/storage/hook integration
+ */
+#include "dhcp_core.h"
+
+int dhcp_server_set_core(dhcp_server_t *server, dhcp_core_t *core);
+dhcp_core_t *dhcp_server_get_core(dhcp_server_t *server);
+int dhcp_server_dispatch_hook(dhcp_server_t *server, dhcp_hook_type_t type, void *data);
+
 #ifdef __cplusplus
 }
 #endif
