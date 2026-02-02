@@ -15,6 +15,16 @@ CFLAGS += -Iinclude -Isrc/util -Isrc/cint
 LDFLAGS = -lpthread -lrt -lreadline -lm 
 LDFLAGS += -L$(BUILDDIR) -Wl,-rpath,'$$ORIGIN'
 
+# Backend selection: epoll (default) or uring
+BACKEND ?= epoll
+
+ifeq ($(BACKEND), uring)
+    CFLAGS += -DQD_BACKEND_URING
+    LDFLAGS += -luring
+else
+    CFLAGS += -DQD_BACKEND_EPOLL
+endif
+
 DEBUG ?= 0
 ifeq ($(DEBUG), 1)
     CFLAGS += -g -O0 -DDEBUG
@@ -24,6 +34,14 @@ endif
 
 # Sources
 CORE_SRCS = $(wildcard $(SRCDIR)/core/*.c)
+
+# Backend sources (only compile selected backend)
+ifeq ($(BACKEND), uring)
+    BACKEND_SRCS = $(SRCDIR)/core/backend/qd_backend_uring.c
+else
+    BACKEND_SRCS = $(SRCDIR)/core/backend/qd_backend_epoll.c
+endif
+
 IPC_SRCS = $(wildcard $(SRCDIR)/ipc/*.c)
 DAEMON_SRCS = $(wildcard $(SRCDIR)/daemon/*.c)
 CLI_SRCS = $(wildcard $(SRCDIR)/cli/*.c)
@@ -34,6 +52,7 @@ CINT_SRCS = $(wildcard $(SRCDIR)/cint/*.c)
 
 # Objects
 CORE_OBJS = $(CORE_SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
+BACKEND_OBJS = $(BACKEND_SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
 IPC_OBJS = $(IPC_SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
 DAEMON_OBJS = $(DAEMON_SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
 CLI_OBJS = $(CLI_SRCS:$(SRCDIR)/%.c=$(BUILDDIR)/%.o)
@@ -41,7 +60,7 @@ CLIENT_OBJS = $(CLIENT_SRCS:$(CLIENTDIR)/%.c=$(BUILDDIR)/client/%.o)
 
 CINT_OBJS = $(CINT_SRCS:$(SRCDIR)/cint/%.c=$(BUILDDIR)/cint/%.o)
 
-ALL_OBJS = $(CORE_OBJS) $(IPC_OBJS) $(DAEMON_OBJS) $(CLI_OBJS) $(CINT_OBJS)
+ALL_OBJS = $(CORE_OBJS) $(BACKEND_OBJS) $(IPC_OBJS) $(DAEMON_OBJS) $(CLI_OBJS) $(CINT_OBJS)
 
 # Targets
 LIB_STATIC = $(BUILDDIR)/libqdaemon.a
@@ -52,7 +71,7 @@ CLIENT_SHARED = $(BUILDDIR)/libqdclient.so
 EXAMPLES = $(BUILDDIR)/simple_daemon $(BUILDDIR)/multi_instance $(BUILDDIR)/kernel_comm \
            $(BUILDDIR)/meta_cli $(BUILDDIR)/meta_server $(BUILDDIR)/meta_client \
            $(BUILDDIR)/qd_dhcpd $(BUILDDIR)/qd_dhcp_cli
-TESTS = $(BUILDDIR)/test_memory $(BUILDDIR)/test_threadpool $(BUILDDIR)/test_event $(BUILDDIR)/test_ipc
+TESTS = $(BUILDDIR)/test_memory $(BUILDDIR)/test_threadpool $(BUILDDIR)/test_event $(BUILDDIR)/test_ipc $(BUILDDIR)/test_aio
 
 .PHONY: all clean examples tests install kmod kmods
 
@@ -63,11 +82,11 @@ examples: $(EXAMPLES)
 tests: $(TESTS)
 
 # Create directories
-$(BUILDDIR)/core $(BUILDDIR)/ipc $(BUILDDIR)/daemon $(BUILDDIR)/cli $(BUILDDIR)/cint $(BUILDDIR)/client/src:
+$(BUILDDIR)/core $(BUILDDIR)/core/backend $(BUILDDIR)/ipc $(BUILDDIR)/daemon $(BUILDDIR)/cli $(BUILDDIR)/cint $(BUILDDIR)/client/src:
 	mkdir -p $@
 
 # Object compilation
-$(BUILDDIR)/%.o: $(SRCDIR)/%.c | $(BUILDDIR)/core $(BUILDDIR)/ipc $(BUILDDIR)/daemon $(BUILDDIR)/cli
+$(BUILDDIR)/%.o: $(SRCDIR)/%.c | $(BUILDDIR)/core $(BUILDDIR)/core/backend $(BUILDDIR)/ipc $(BUILDDIR)/daemon $(BUILDDIR)/cli
 	$(CC) $(CFLAGS) -fPIC -c $< -o $@
 
 $(BUILDDIR)/client/%.o: $(CLIENTDIR)/%.c | $(BUILDDIR)/client/src
@@ -140,6 +159,9 @@ $(BUILDDIR)/test_event: $(TESTDIR)/test_event.c $(LIB_STATIC)
 
 $(BUILDDIR)/test_ipc: $(TESTDIR)/test_ipc.c $(LIB_STATIC) $(CLIENT_STATIC)
 	$(CC) $(CFLAGS) -I$(CLIENTDIR)/include $< -o $@ -L$(BUILDDIR) -lqdaemon -lqdclient $(LDFLAGS)
+
+$(BUILDDIR)/test_aio: $(TESTDIR)/test_aio.c $(LIB_STATIC)
+	$(CC) $(CFLAGS) $< -o $@ -L$(BUILDDIR) -lqdaemon $(LDFLAGS)
 
 # Run tests
 test: tests
