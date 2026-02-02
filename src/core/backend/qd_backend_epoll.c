@@ -24,6 +24,8 @@ typedef struct qd_ep_pending {
     struct qd_ep_pending *next;
     struct qd_ep_pending *prev;
     int registered;               /* Is fd registered with epoll */
+    int is_watch;                /* Is this a watched fd (for channel watch) */
+    void *watch_user_data;       /* user_data for watched fd completion */
 } qd_ep_pending_t;
 
 /* Epoll backend context */
@@ -50,6 +52,8 @@ static uint32_t qd_ep_op_to_events(qd_op_type_t op)
         return EPOLLOUT;
     case QD_OP_POLL:
         return EPOLLIN | EPOLLOUT;
+    case QD_OP_CHANNEL:
+        return EPOLLIN;
     default:
         return 0;
     }
@@ -151,7 +155,7 @@ static int qd_ep_submit(void *ctx, qd_aio_req_t *req)
     }
 
     if (req->op == QD_OP_CANCEL) {
-        /* Find and remove the pending operation */
+        /* Find and remove pending operation */
         qd_ep_pending_t *p = ep->pending_head;
         while (p) {
             if (p->req.user_data == req->user_data) {
@@ -174,7 +178,8 @@ static int qd_ep_submit(void *ctx, qd_aio_req_t *req)
 
     pending->req = *req;
     pending->next = NULL;
-    pending->prev = ep->pending_tail;
+    pending->prev = NULL;
+    pending->registered = 0;
 
     /* Add to pending list */
     if (ep->pending_tail)
@@ -214,9 +219,9 @@ static int qd_ep_submit(void *ctx, qd_aio_req_t *req)
                 return -errno;
             }
         }
-        pending->registered = 1;
     }
 
+    pending->registered = 1;
     return QD_OK;
 }
 
@@ -265,7 +270,7 @@ static int qd_ep_do_io(qd_aio_req_t *req)
             if (getsockopt(req->fd, SOL_SOCKET, SO_ERROR, &error, &len) < 0)
                 result = -1;
             else if (error)
-                result = -1, errno = error;
+                result = -1;
             else
                 result = 0;
         }
@@ -281,6 +286,11 @@ static int qd_ep_do_io(qd_aio_req_t *req)
 
     case QD_OP_POLL:
         /* Poll completed, just return success */
+        result = 0;
+        break;
+
+    case QD_OP_CHANNEL:
+        /* Channel operation - handled specially in wait */
         result = 0;
         break;
 
@@ -314,7 +324,19 @@ static int qd_ep_wait(void *ctx, qd_completion_t *out, int max, int timeout_ms)
 
         qd_aio_req_t *req = &pending->req;
 
-        /* Perform the actual I/O */
+        /* Handle watched file descriptors (channel watch) */
+        if (pending->is_watch) {
+            /* Channel/eventfd is readable - generate completion for user to drain */
+            out[count].user_data = pending->watch_user_data;
+            out[count].result = 0;
+            out[count].flags = 0;
+            out[count].op = QD_OP_CHANNEL;
+            count++;
+            /* Keep watching - don't remove from epoll */
+            continue;
+        }
+
+        /* Regular I/O operations */
         int result = qd_ep_do_io(req);
 
         /* Fill completion */
@@ -339,6 +361,68 @@ static int qd_ep_pending(void *ctx)
     return ep->pending_count;
 }
 
+/* Watch arbitrary file descriptor */
+static int qd_ep_watch_fd(void *ctx, int fd, void *user_data)
+{
+    qd_ep_backend_t *ep = ctx;
+
+    /* Create a pending node for the watched fd */
+    qd_ep_pending_t *pending = qd_calloc(1, sizeof(*pending));
+    if (!pending)
+        return QD_ERR_NOMEM;
+
+    pending->req.op = QD_OP_CHANNEL;
+    pending->req.fd = fd;
+    pending->req.user_data = user_data;
+    pending->is_watch = 1;
+    pending->watch_user_data = user_data;
+
+    /* Add to pending list */
+    if (ep->pending_tail)
+        ep->pending_tail->next = pending;
+    else
+        ep->pending_head = pending;
+    ep->pending_tail = pending;
+    ep->pending_count++;
+
+    /* Register with epoll */
+    struct epoll_event ev = {
+        .events = EPOLLIN,
+        .data.ptr = pending
+    };
+
+    if (epoll_ctl(ep->epoll_fd, EPOLL_CTL_ADD, fd, &ev) == -1) {
+        qd_ep_remove_pending(ep, pending);
+        qd_free(pending);
+        return -errno;
+    }
+
+    pending->registered = 1;
+    return QD_OK;
+}
+
+/* Unwatch file descriptor */
+static int qd_ep_unwatch_fd(void *ctx, int fd)
+{
+    qd_ep_backend_t *ep = ctx;
+
+    /* Find and remove pending operation */
+    qd_ep_pending_t *p = ep->pending_head;
+    while (p) {
+        if (p->req.fd == fd && p->is_watch) {
+            if (p->registered) {
+                epoll_ctl(ep->epoll_fd, EPOLL_CTL_DEL, fd, NULL);
+            }
+            qd_ep_remove_pending(ep, p);
+            qd_free(p);
+            return QD_OK;
+        }
+        p = p->next;
+    }
+
+    return QD_ERR_NOENT;
+}
+
 /* Export backend ops */
 const qd_backend_ops_t qd_backend_epoll = {
     .name         = "epoll",
@@ -349,4 +433,6 @@ const qd_backend_ops_t qd_backend_epoll = {
     .submit_batch = qd_ep_submit_batch,
     .wait         = qd_ep_wait,
     .pending      = qd_ep_pending,
+    .watch_fd     = qd_ep_watch_fd,
+    .unwatch_fd   = qd_ep_unwatch_fd,
 };

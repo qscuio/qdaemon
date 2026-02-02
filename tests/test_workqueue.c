@@ -12,6 +12,16 @@
 #include <qdaemon/qd_aio.h>
 #include <qdaemon/qd_threadpool.h>
 
+/* Global loop callback to dispatch workqueue events */
+static void loop_callback(qd_completion_t *comp, void *arg)
+{
+    (void)arg;
+    if (comp->op == QD_OP_CHANNEL) {
+        qd_workqueue_t *wq = (qd_workqueue_t *)comp->user_data;
+        qd_workqueue_process(wq);
+    }
+}
+
 #define TEST(name) static void test_##name(void)
 #define RUN_TEST(name) do { \
     printf("  %-40s", #name); \
@@ -40,7 +50,10 @@ static void *simple_work(void *arg)
 
 TEST(create_destroy)
 {
-    qd_aio_loop_t *loop = qd_aio_create();
+    qd_aio_config_t config = QD_AIO_CONFIG_DEFAULT;
+    config.callback = loop_callback;
+
+    qd_aio_loop_t *loop = qd_aio_create_ex(&config);
     assert(loop != NULL);
 
     qd_threadpool_t *pool = qd_threadpool_create(2);
@@ -57,7 +70,10 @@ TEST(create_destroy)
 
 TEST(immediate_work)
 {
-    qd_aio_loop_t *loop = qd_aio_create();
+    qd_aio_config_t config = QD_AIO_CONFIG_DEFAULT;
+    config.callback = loop_callback;
+
+    qd_aio_loop_t *loop = qd_aio_create_ex(&config);
     qd_threadpool_t *pool = qd_threadpool_create(2);
     qd_workqueue_t *wq = qd_workqueue_create(loop, pool,
                                                   on_work_complete, NULL);
@@ -66,7 +82,12 @@ TEST(immediate_work)
     assert(qd_workqueue_submit(wq, simple_work, NULL) == QD_OK);
 
     /* Run loop once to process completion */
-    qd_aio_run_once(loop, 100);
+    /* We might need a few iterations for threadpool to pick up and finish */
+    for (int i = 0; i < 10; i++) {
+        qd_aio_run_once(loop, 100);
+        if (completion_count > 0) break;
+    }
+
     assert(completion_count == 1);
     assert(last_status == QD_WORK_OK);
     assert((uintptr_t)last_result == 42);
@@ -78,7 +99,10 @@ TEST(immediate_work)
 
 TEST(pending_count)
 {
-    qd_aio_loop_t *loop = qd_aio_create();
+    qd_aio_config_t config = QD_AIO_CONFIG_DEFAULT;
+    config.callback = loop_callback;
+
+    qd_aio_loop_t *loop = qd_aio_create_ex(&config);
     qd_threadpool_t *pool = qd_threadpool_create(2);
     qd_workqueue_t *wq = qd_workqueue_create(loop, pool,
                                                   on_work_complete, NULL);

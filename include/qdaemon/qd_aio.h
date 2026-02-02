@@ -17,8 +17,9 @@
 extern "C" {
 #endif
 
-/* Forward declaration */
+/* Forward declarations */
 typedef struct qd_aio_loop qd_aio_loop_t;
+typedef struct qd_channel qd_channel_t;
 
 /* Completion callback */
 typedef void (*qd_aio_cb_t)(qd_completion_t *comp, void *arg);
@@ -157,6 +158,17 @@ typedef struct qd_aio_stats {
 } qd_aio_stats_t;
 
 void qd_aio_stats(qd_aio_loop_t *loop, qd_aio_stats_t *stats);
+
+/*
+ * Channel Watching
+ */
+
+/* Watch a channel for readability - generates QD_OP_CHANNEL completions */
+int qd_aio_channel_watch(qd_aio_loop_t *loop, qd_channel_t *chan,
+                         void *user_data);
+
+/* Stop watching a channel */
+int qd_aio_channel_unwatch(qd_aio_loop_t *loop, qd_channel_t *chan);
 
 #ifdef __cplusplus
 }

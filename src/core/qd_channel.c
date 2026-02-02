@@ -329,6 +329,23 @@ int qd_channel_fd(qd_channel_t *chan)
     return chan->eventfd;
 }
 
+void qd_channel_ack(qd_channel_t *chan)
+{
+    if (!chan || chan->eventfd < 0) {
+        return;
+    }
+
+    uint64_t val;
+    /* Read from eventfd to clear it */
+    while (read(chan->eventfd, &val, sizeof(val)) > 0) {
+        /* Keep reading until EAGAIN if needed,
+           but usually one read is enough for EFD_SEMAPHORE or default */
+    }
+
+    /* Reset pending count so next send will trigger eventfd write */
+    atomic_store(&chan->pending, 0);
+}
+
 int qd_channel_capacity(qd_channel_t *chan)
 {
     if (!chan) {

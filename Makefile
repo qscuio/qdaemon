@@ -71,7 +71,7 @@ CLIENT_SHARED = $(BUILDDIR)/libqdclient.so
 EXAMPLES = $(BUILDDIR)/simple_daemon $(BUILDDIR)/multi_instance $(BUILDDIR)/kernel_comm \
            $(BUILDDIR)/meta_cli $(BUILDDIR)/meta_server $(BUILDDIR)/meta_client \
            $(BUILDDIR)/qd_dhcpd $(BUILDDIR)/qd_dhcp_cli
-TESTS = $(BUILDDIR)/test_memory $(BUILDDIR)/test_threadpool $(BUILDDIR)/test_event $(BUILDDIR)/test_ipc $(BUILDDIR)/test_aio $(BUILDDIR)/test_channel
+TESTS = $(BUILDDIR)/test_memory $(BUILDDIR)/test_threadpool $(BUILDDIR)/test_event $(BUILDDIR)/test_ipc $(BUILDDIR)/test_aio $(BUILDDIR)/test_channel $(BUILDDIR)/test_channel_watch $(BUILDDIR)/test_workqueue
 
 .PHONY: all clean examples tests install kmod kmods
 
@@ -164,6 +164,12 @@ $(BUILDDIR)/test_aio: $(TESTDIR)/test_aio.c $(LIB_STATIC)
 	$(CC) $(CFLAGS) $< -o $@ -L$(BUILDDIR) -lqdaemon $(LDFLAGS)
 
 $(BUILDDIR)/test_channel: $(TESTDIR)/test_channel.c $(LIB_STATIC)
+	$(CC) $(CFLAGS) $< -o $@ -L$(BUILDDIR) -lqdaemon $(LDFLAGS)
+
+$(BUILDDIR)/test_channel_watch: $(TESTDIR)/test_channel_watch.c $(LIB_STATIC)
+	$(CC) $(CFLAGS) $< -o $@ -L$(BUILDDIR) -lqdaemon $(LDFLAGS)
+
+$(BUILDDIR)/test_workqueue: $(TESTDIR)/test_workqueue.c $(LIB_STATIC)
 	$(CC) $(CFLAGS) $< -o $@ -L$(BUILDDIR) -lqdaemon $(LDFLAGS)
 
 # Run tests

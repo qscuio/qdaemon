@@ -44,8 +44,16 @@ int qd_channel_try_recv(qd_channel_t *chan, void *item);       /* non-blocking *
 
 /* For event loop integration */
 int qd_channel_fd(qd_channel_t *chan);  /* Returns pollable eventfd */
+void qd_channel_ack(qd_channel_t *chan); /* Acknowledge events (clear eventfd) */
 int qd_channel_capacity(qd_channel_t *chan);  /* Total capacity */
 int qd_channel_size(qd_channel_t *chan);       /* Current item count */
+
+/* Get item size for a workqueue result type */
+static inline size_t qd_channel_item_size(qd_channel_t *chan)
+{
+    (void)chan;
+    return sizeof(void*) + sizeof(int);  /* For result_struct_t */
+}
 
 #ifdef __cplusplus
 }

@@ -16,6 +16,7 @@
 #include "qdaemon/qd_workqueue.h"
 #include "qdaemon/qd_threadpool.h"
 #include "qdaemon/qd_aio.h"
+#include "qdaemon/qd_channel.h"
 #include "qdaemon/qd_memory.h"
 #include "qdaemon/qd_log.h"
 
@@ -86,7 +87,7 @@ static void work_complete_callback(void *arg, int status)
         return;
     }
 
-    /* Push completion to channel */
+    /* Push completion to channel - send work pointer and status */
     result_struct_t result = {
         .work = work,
         .status = work->status
@@ -102,6 +103,7 @@ static void work_complete_callback(void *arg, int status)
 static void drain_channel_completions(qd_workqueue_t *wq)
 {
     result_struct_t result;
+
     while (qd_channel_try_recv(wq->channel, &result) == QD_OK) {
         qd_work_t *work = result.work;
 
@@ -119,6 +121,16 @@ static void drain_channel_completions(qd_workqueue_t *wq)
         }
 
         atomic_fetch_sub(&wq->pending, 1);
+    }
+
+    /* Acknowledge events to clear eventfd */
+    qd_channel_ack(wq->channel);
+}
+
+void qd_workqueue_process(qd_workqueue_t *wq)
+{
+    if (wq) {
+        drain_channel_completions(wq);
     }
 }
 
@@ -191,6 +203,14 @@ qd_workqueue_t *qd_workqueue_create(qd_aio_loop_t *loop,
         return NULL;
     }
 
+    /* Register channel with event loop */
+    if (qd_aio_channel_watch(loop, wq->channel, wq) != QD_OK) {
+        qd_log_error("Failed to watch workqueue channel");
+        qd_channel_destroy(wq->channel);
+        qd_free(wq);
+        return NULL;
+    }
+
     qd_log_debug("Created workqueue: loop=%p, pool=%p", loop, pool);
 
     return wq;
@@ -201,6 +221,9 @@ void qd_workqueue_destroy(qd_workqueue_t *wq)
     if (!wq) {
         return;
     }
+
+    /* Stop watching channel */
+    qd_aio_channel_unwatch(wq->loop, wq->channel);
 
     /* Set draining flag to stop new completions */
     atomic_store(&wq->draining, 1);

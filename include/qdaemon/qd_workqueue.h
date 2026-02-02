@@ -81,6 +81,9 @@ void qd_work_handle_release(qd_work_handle_t *handle);
 /* Internal channel access (for workqueue implementation) */
 qd_channel_t *qd_workqueue_channel(qd_workqueue_t *wq);
 
+/* Process completions from the workqueue channel (call this when QD_OP_CHANNEL triggers) */
+void qd_workqueue_process(qd_workqueue_t *wq);
+
 #ifdef __cplusplus
 }
 #endif

@@ -9,6 +9,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <errno.h>
+#include <string.h>
 
 /* Version information */
 #define QD_VERSION_MAJOR 1

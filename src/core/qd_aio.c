@@ -15,6 +15,7 @@
 #include "qdaemon/qd_aio.h"
 #include "qdaemon/qd_memory.h"
 #include "qdaemon/qd_log.h"
+#include "qdaemon/qd_channel.h"
 #include "backend/qd_backend.h"
 
 /* Async I/O loop structure */
@@ -377,4 +378,28 @@ void qd_aio_stats(qd_aio_loop_t *loop, qd_aio_stats_t *stats)
     stats->complete_count = loop->complete_count;
     stats->error_count = loop->error_count;
     stats->pending = loop->backend->pending(loop->backend_ctx);
+}
+
+/*
+ * Channel watching
+ */
+int qd_aio_channel_watch(qd_aio_loop_t *loop, qd_channel_t *chan,
+                         void *user_data)
+{
+    if (!loop || !chan) {
+        return QD_ERR_INVAL;
+    }
+
+    return loop->backend->watch_fd(loop->backend_ctx,
+                                   qd_channel_fd(chan), user_data);
+}
+
+int qd_aio_channel_unwatch(qd_aio_loop_t *loop, qd_channel_t *chan)
+{
+    if (!loop || !chan) {
+        return QD_ERR_INVAL;
+    }
+
+    return loop->backend->unwatch_fd(loop->backend_ctx,
+                                     qd_channel_fd(chan));
 }

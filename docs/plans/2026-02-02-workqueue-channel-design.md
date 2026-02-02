@@ -195,7 +195,7 @@ Hierarchical timer wheel (like Linux kernel) for O(1) delayed task scheduling.
 
 - Resolution: 1ms granularity
 - Driven by `qd_aio_timeout()` - reschedules next expiry after each batch
-- Internal implementation, not public API
+- Exposed via `qd_timer.h` for general use
 
 ### Work Lifecycle
 
@@ -273,7 +273,7 @@ include/qdaemon/
 src/core/
 ├── qd_channel.c          # Channel implementation (ring buffer + eventfd)
 ├── qd_workqueue.c        # Work queue implementation
-└── qd_timerwheel.c       # Hierarchical timer wheel for delayed work
+└── qd_timer.c            # Hierarchical timer wheel for delayed work
 
 tests/
 ├── test_channel.c        # Channel unit tests
@@ -282,7 +282,7 @@ tests/
 
 ### Modifications to Existing Files
 
-- `include/qdaemon/qd_aio_ops.h` → add `QD_OP_CHANNEL = 20`
+- `include/qdaemon/qd_aio_ops.h` → add `QD_OP_CHANNEL`
 - `src/core/qd_aio.c` → add `qd_aio_channel_watch()` and `qd_aio_channel_unwatch()`
 
 ## Dependencies
@@ -291,12 +291,39 @@ tests/
 |-----------|------------|
 | `qd_channel` | `qd_memory`, `qd_log` |
 | `qd_workqueue` | `qd_channel`, `qd_threadpool`, `qd_aio`, `qd_log` |
-| `qd_timerwheel` | `qd_memory` (internal) |
+| `qd_timer` | `qd_memory` (internal) |
 
 ## Implementation Order
 
 1. `qd_channel` - standalone, can be tested independently
 2. `qd_aio` integration - add `QD_OP_CHANNEL` and watch/unwatch
-3. `qd_timerwheel` - internal component
+3. `qd_timer` - internal component
 4. `qd_workqueue` - ties everything together
 5. Tests for each component
+
+## Limitations
+
+- **Backend Support**: `qd_workqueue_submit_delayed()` relies on `QD_OP_TIMEOUT`. If the underlying AIO backend (e.g., current epoll implementation) does not support this operation, delayed submission will fail with `QD_ERR_NOSYS`.
+- **Cancellation**: Running work cannot be interrupted; cancellation only affects pending work.
+
+## Performance Considerations
+
+- **Lock Contention**: The channel uses a mutex for blocking operations but uses atomic indices for the ring buffer state. `try_send` and `try_recv` minimize locking overhead.
+- **Memory Allocation**: Work items are allocated on the heap. For high-throughput scenarios, a slab allocator or object pool for `qd_work_t` would reduce allocator pressure.
+- **Event Loop Overhead**: Each batch of completions signals the eventfd once. The `drain_channel_completions` function processes all available items in a single event loop iteration to amortize the wake-up cost.
+- **False Sharing**: `qd_channel_t` structure layout should ensure that producer (`tail`) and consumer (`head`) indices are on separate cache lines to prevent false sharing in high-contention scenarios.
+
+## Future Improvements
+
+- **Lock-free Channel**: Replace the mutex-protected ring buffer with a fully lock-free MPSC queue (e.g., Vyukov's bounded MPSC) for lower latency.
+- **Work Object Pooling**: Add a built-in object pool for `qd_work_t` structures to minimize `malloc`/`free` overhead.
+- **Priority Support**: Add support for high-priority work items that bypass the normal queue.
+- **Affinity Control**: Allow pinning worker threads to specific CPU cores and submitting work to specific threads.
+
+## Verification
+
+The implementation should be verified with:
+1.  **Unit Tests**: Isolated tests for `qd_channel` (overflow, blocking, non-blocking) and `qd_timer_wheel` (precision, ordering).
+2.  **Integration Tests**: Verify `qd_workqueue` correctly offloads work and triggers completion callbacks on the event loop thread.
+3.  **Stress Tests**: High-concurrency producer/consumer tests to catch race conditions in the channel or cancellation logic.
+4.  **Leak Detection**: Run tests under Valgrind/ASan to ensure no memory leaks in the work lifecycle, especially during cancellation.

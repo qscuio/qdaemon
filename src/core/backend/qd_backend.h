@@ -30,15 +30,19 @@ typedef struct qd_backend_ops {
     /* Submit batch of operations */
     int (*submit_batch)(void *ctx, qd_aio_req_t *reqs, int count);
 
-    /* Wait for completions
-     * Returns: number of completions, or -errno on error
-     * timeout_ms: -1 for infinite, 0 for non-blocking, >0 for timeout
-     */
+    /* Wait for completions */
+    /* Returns: number of completions, or -errno on error */
+    /* timeout_ms: -1 for infinite, 0 for non-blocking, >0 for timeout */
     int (*wait)(void *ctx, qd_completion_t *out, int max, int timeout_ms);
 
     /* Get number of pending operations */
     int (*pending)(void *ctx);
 
+    /* Watch arbitrary file descriptor for read readiness */
+    int (*watch_fd)(void *ctx, int fd, void *user_data);
+
+    /* Unwatch file descriptor */
+    int (*unwatch_fd)(void *ctx, int fd);
 } qd_backend_ops_t;
 
 /* Backend implementations */
