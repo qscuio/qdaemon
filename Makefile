@@ -172,6 +172,9 @@ $(BUILDDIR)/test_channel_watch: $(TESTDIR)/test_channel_watch.c $(LIB_STATIC)
 $(BUILDDIR)/test_workqueue: $(TESTDIR)/test_workqueue.c $(LIB_STATIC)
 	$(CC) $(CFLAGS) $< -o $@ -L$(BUILDDIR) -lqdaemon $(LDFLAGS)
 
+$(BUILDDIR)/bench_event: $(TESTDIR)/bench_event.c $(LIB_STATIC)
+	$(CC) $(CFLAGS) $< -o $@ -L$(BUILDDIR) -lqdaemon $(LDFLAGS)
+
 # Run tests
 test: tests
 	@for t in $(TESTS); do echo "Running $$t..."; $$t || exit 1; done
