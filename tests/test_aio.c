@@ -24,12 +24,14 @@
 
 static atomic_int completion_count;
 static int last_result;
+static qd_op_type_t last_op;
 
 static void test_callback(qd_completion_t *comp, void *arg)
 {
     (void)arg;
     atomic_fetch_add(&completion_count, 1);
     last_result = comp->result;
+    last_op = comp->op;
 }
 
 /* Test basic creation */
@@ -169,6 +171,29 @@ TEST(multiple_ops)
     qd_aio_destroy(loop);
 }
 
+/* Test timeout operation */
+TEST(timeout)
+{
+    atomic_store(&completion_count, 0);
+
+    qd_aio_config_t config = QD_AIO_CONFIG_DEFAULT;
+    config.callback = test_callback;
+
+    qd_aio_loop_t *loop = qd_aio_create_ex(&config);
+    assert(loop != NULL);
+
+    assert(qd_aio_timeout(loop, 10, NULL) == QD_OK);
+
+    for (int i = 0; i < 10 && atomic_load(&completion_count) == 0; i++) {
+        qd_aio_run_once(loop, 50);
+    }
+
+    assert(atomic_load(&completion_count) == 1);
+    assert(last_op == QD_OP_TIMEOUT);
+
+    qd_aio_destroy(loop);
+}
+
 /* Test statistics */
 TEST(statistics)
 {
@@ -231,6 +256,7 @@ int main(void)
     RUN_TEST(backend_info);
     RUN_TEST(pipe_read_write);
     RUN_TEST(multiple_ops);
+    RUN_TEST(timeout);
     RUN_TEST(statistics);
     RUN_TEST(run_stop);
 

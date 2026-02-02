@@ -9,6 +9,7 @@
 
 #include <sys/epoll.h>
 #include <sys/socket.h>
+#include <sys/timerfd.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -149,9 +150,21 @@ static int qd_ep_submit(void *ctx, qd_aio_req_t *req)
     }
 
     if (req->op == QD_OP_TIMEOUT) {
-        /* Timeout handled via epoll_wait timeout */
-        qd_log_warn("epoll backend does not support standalone timeout ops");
-        return QD_ERR_NOSYS;
+        int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+        if (tfd < 0)
+            return -errno;
+
+        struct itimerspec its;
+        memset(&its, 0, sizeof(its));
+        its.it_value.tv_sec = req->aux / 1000;
+        its.it_value.tv_nsec = (req->aux % 1000) * 1000000;
+        if (timerfd_settime(tfd, 0, &its, NULL) < 0) {
+            int err = -errno;
+            close(tfd);
+            return err;
+        }
+
+        req->fd = tfd;
     }
 
     if (req->op == QD_OP_CANCEL) {
@@ -161,6 +174,9 @@ static int qd_ep_submit(void *ctx, qd_aio_req_t *req)
             if (p->req.user_data == req->user_data) {
                 if (p->registered) {
                     epoll_ctl(ep->epoll_fd, EPOLL_CTL_DEL, p->req.fd, NULL);
+                }
+                if (p->req.op == QD_OP_TIMEOUT) {
+                    close(p->req.fd);
                 }
                 qd_ep_remove_pending(ep, p);
                 qd_free(p);
@@ -289,6 +305,20 @@ static int qd_ep_do_io(qd_aio_req_t *req)
         result = 0;
         break;
 
+    case QD_OP_TIMEOUT:
+        {
+            uint64_t expirations = 0;
+            result = read(req->fd, &expirations, sizeof(expirations));
+            if (result < 0) {
+                /* If already drained, treat as success */
+                if (errno == EAGAIN)
+                    result = 0;
+            } else {
+                result = 0;
+            }
+        }
+        break;
+
     case QD_OP_CHANNEL:
         /* Channel operation - handled specially in wait */
         result = 0;
@@ -348,6 +378,9 @@ static int qd_ep_wait(void *ctx, qd_completion_t *out, int max, int timeout_ms)
 
         /* Remove from epoll and pending list */
         epoll_ctl(ep->epoll_fd, EPOLL_CTL_DEL, req->fd, NULL);
+        if (req->op == QD_OP_TIMEOUT) {
+            close(req->fd);
+        }
         qd_ep_remove_pending(ep, pending);
         qd_free(pending);
     }

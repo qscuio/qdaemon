@@ -41,19 +41,15 @@ int qd_channel_send(qd_channel_t *chan, const void *item);     /* blocks if full
 int qd_channel_recv(qd_channel_t *chan, void *item);           /* blocks if empty */
 int qd_channel_try_send(qd_channel_t *chan, const void *item); /* non-blocking */
 int qd_channel_try_recv(qd_channel_t *chan, void *item);       /* non-blocking */
+int qd_channel_try_recv_batch(qd_channel_t *chan, void *items, int max_items); /* non-blocking batch */
 
 /* For event loop integration */
 int qd_channel_fd(qd_channel_t *chan);  /* Returns pollable eventfd */
 void qd_channel_ack(qd_channel_t *chan); /* Acknowledge events (clear eventfd) */
+void qd_channel_close(qd_channel_t *chan); /* Close channel (wake up waiters) */
 int qd_channel_capacity(qd_channel_t *chan);  /* Total capacity */
 int qd_channel_size(qd_channel_t *chan);       /* Current item count */
-
-/* Get item size for a workqueue result type */
-static inline size_t qd_channel_item_size(qd_channel_t *chan)
-{
-    (void)chan;
-    return sizeof(void*) + sizeof(int);  /* For result_struct_t */
-}
+size_t qd_channel_item_size(qd_channel_t *chan); /* Get item size */
 
 #ifdef __cplusplus
 }

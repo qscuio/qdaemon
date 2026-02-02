@@ -7,6 +7,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <errno.h>
+#include <sys/eventfd.h>
 #include <pthread.h>
 #include <errno.h>
 #include <time.h>
@@ -14,6 +16,119 @@
 #include "qdaemon/qd_threadpool.h"
 #include "qdaemon/qd_memory.h"
 #include "../util/qd_atomic.h"
+
+/*
+ * Lock-free bounded MPMC ring for external submissions.
+ * Based on Dmitry Vyukov's MPMC queue algorithm.
+ */
+typedef struct qd_mpmc_cell {
+    _Atomic size_t seq;
+    qd_task_t *task;
+} qd_mpmc_cell_t;
+
+struct qd_mpmc_ring {
+    qd_mpmc_cell_t *cells;
+    size_t capacity;
+    size_t mask;
+    _Atomic size_t head;
+    _Atomic size_t tail;
+};
+
+static int qd_mpmc_ring_init(qd_mpmc_ring_t *ring, size_t capacity)
+{
+    if (!ring || capacity == 0)
+        return -1;
+
+    capacity = qd_next_pow2_64(capacity);
+    ring->cells = qd_calloc(capacity, sizeof(*ring->cells));
+    if (!ring->cells)
+        return -1;
+
+    ring->capacity = capacity;
+    ring->mask = capacity - 1;
+    atomic_init(&ring->head, 0);
+    atomic_init(&ring->tail, 0);
+
+    for (size_t i = 0; i < capacity; i++) {
+        atomic_init(&ring->cells[i].seq, i);
+        ring->cells[i].task = NULL;
+    }
+
+    return 0;
+}
+
+static void qd_mpmc_ring_destroy(qd_mpmc_ring_t *ring)
+{
+    if (!ring)
+        return;
+    qd_free(ring->cells);
+    ring->cells = NULL;
+    ring->capacity = 0;
+    ring->mask = 0;
+}
+
+static QD_MAYBE_UNUSED int qd_mpmc_ring_push(qd_mpmc_ring_t *ring, qd_task_t *task)
+{
+    qd_mpmc_cell_t *cell;
+    size_t pos = atomic_load_explicit(&ring->tail, memory_order_relaxed);
+
+    for (;;) {
+        cell = &ring->cells[pos & ring->mask];
+        size_t seq = atomic_load_explicit(&cell->seq, memory_order_acquire);
+        intptr_t dif = (intptr_t)seq - (intptr_t)pos;
+        if (dif == 0) {
+            if (atomic_compare_exchange_weak_explicit(
+                    &ring->tail, &pos, pos + 1,
+                    memory_order_acq_rel, memory_order_relaxed)) {
+                break;
+            }
+        } else if (dif < 0) {
+            return QD_ERR_BUSY; /* full */
+        } else {
+            pos = atomic_load_explicit(&ring->tail, memory_order_relaxed);
+        }
+    }
+
+    cell->task = task;
+    atomic_store_explicit(&cell->seq, pos + 1, memory_order_release);
+    return QD_OK;
+}
+
+static int qd_mpmc_ring_pop(qd_mpmc_ring_t *ring, qd_task_t **task_out)
+{
+    qd_mpmc_cell_t *cell;
+    size_t pos = atomic_load_explicit(&ring->head, memory_order_relaxed);
+
+    for (;;) {
+        cell = &ring->cells[pos & ring->mask];
+        size_t seq = atomic_load_explicit(&cell->seq, memory_order_acquire);
+        intptr_t dif = (intptr_t)seq - (intptr_t)(pos + 1);
+        if (dif == 0) {
+            if (atomic_compare_exchange_weak_explicit(
+                    &ring->head, &pos, pos + 1,
+                    memory_order_acq_rel, memory_order_relaxed)) {
+                break;
+            }
+        } else if (dif < 0) {
+            return QD_ERR_AGAIN; /* empty */
+        } else {
+            pos = atomic_load_explicit(&ring->head, memory_order_relaxed);
+        }
+    }
+
+    *task_out = cell->task;
+    atomic_store_explicit(&cell->seq, pos + ring->capacity, memory_order_release);
+    return QD_OK;
+}
+
+static inline void qd_pool_wake(qd_threadpool_t *pool, uint64_t count)
+{
+    if (!pool || pool->wake_fd < 0 || count == 0)
+        return;
+    uint64_t val = count;
+    ssize_t ret = write(pool->wake_fd, &val, sizeof(val));
+    (void)ret;
+}
 
 /* Thread-local worker ID */
 static __thread int tls_worker_id = -1;
@@ -261,6 +376,28 @@ static qd_task_t *work_queue_pop(qd_work_queue_t *queue)
     return task;
 }
 
+static qd_task_t *work_queue_pop_priority(qd_work_queue_t *queue)
+{
+    qd_task_t *task = NULL;
+
+    pthread_mutex_lock(&queue->lock);
+    for (int i = QD_PRIORITY_COUNT - 1; i >= 0; i--) {
+        if (queue->priority_heads[i]) {
+            task = queue->priority_heads[i];
+            queue->priority_heads[i] = task->next;
+            if (!queue->priority_heads[i])
+                queue->priority_tails[i] = NULL;
+            task->next = NULL;
+            pthread_mutex_unlock(&queue->lock);
+            qd_atomic_fetch_sub(&queue->count, 1);
+            return task;
+        }
+    }
+    pthread_mutex_unlock(&queue->lock);
+
+    return NULL;
+}
+
 static qd_task_t *work_queue_steal(qd_work_queue_t *queue)
 {
     qd_task_t *task = qd_wsdeque_steal(&queue->deque);
@@ -392,17 +529,47 @@ static void *worker_thread(void *arg)
 
     tls_worker_id = worker->id;
 
-    while (qd_atomic_load(&pool->running) &&
-           qd_atomic_load(&pool->shutdown_mode) == 0) {
+    while (1) {
+        int shutdown = qd_atomic_load(&pool->shutdown_mode);
+        if (shutdown == QD_SHUTDOWN_IMMEDIATE + 1)
+            break;
+
+        if (shutdown == QD_SHUTDOWN_GRACEFUL + 1 &&
+            qd_atomic_load(&pool->pending_tasks) == 0)
+            break;
+
+        if (shutdown == 0 && qd_atomic_load(&pool->paused)) {
+            qd_atomic_store(&worker->idle, 1);
+            uint64_t val;
+            ssize_t ret = read(pool->wake_fd, &val, sizeof(val));
+            if (ret < 0 && errno != EINTR) {
+                /* Ignore wake errors and retry */
+            }
+            continue;
+        }
 
         qd_task_t *task = NULL;
 
         /* Try local queue first */
         task = work_queue_pop(worker->queue);
 
-        /* Try global queue */
+        /* Try global priority queue */
         if (!task) {
-            task = work_queue_pop(&pool->global_queue);
+            task = work_queue_pop_priority(&pool->global_queue);
+        }
+
+        /* Try external ring for this worker */
+        if (!task && worker->ext_ring) {
+            if (qd_mpmc_ring_pop(worker->ext_ring, &task) != QD_OK) {
+                task = NULL;
+            }
+        }
+
+        /* Try global ring */
+        if (!task && pool->global_ring) {
+            if (qd_mpmc_ring_pop(pool->global_ring, &task) != QD_OK) {
+                task = NULL;
+            }
         }
 
         /* Try stealing from other workers */
@@ -410,7 +577,14 @@ static void *worker_thread(void *arg)
             for (int i = 0; i < pool->num_workers && !task; i++) {
                 if (i != worker->id) {
                     int victim = (worker->id + i) % pool->num_workers;
-                    task = work_queue_steal(&pool->queues[victim]);
+                    if (pool->workers[victim].ext_ring) {
+                        if (qd_mpmc_ring_pop(pool->workers[victim].ext_ring, &task) != QD_OK) {
+                            task = NULL;
+                        }
+                    }
+                    if (!task) {
+                        task = work_queue_steal(&pool->queues[victim]);
+                    }
                     if (task) {
                         worker->tasks_stolen++;
                         qd_atomic_fetch_add(&pool->total_stolen, 1);
@@ -458,18 +632,47 @@ static void *worker_thread(void *arg)
             /* No work available, wait */
             qd_atomic_store(&worker->idle, 1);
 
-            pthread_mutex_lock(&pool->mutex);
-            if (qd_atomic_load(&pool->running) &&
-                qd_atomic_load(&pool->pending_tasks) == 0 &&
-                qd_atomic_load(&pool->shutdown_mode) == 0) {
-                pthread_cond_wait(&pool->cond, &pool->mutex);
+            shutdown = qd_atomic_load(&pool->shutdown_mode);
+            if (shutdown == QD_SHUTDOWN_IMMEDIATE + 1)
+                break;
+
+            if (shutdown == QD_SHUTDOWN_GRACEFUL + 1 &&
+                qd_atomic_load(&pool->pending_tasks) == 0)
+                break;
+
+            uint64_t val;
+            ssize_t ret = read(pool->wake_fd, &val, sizeof(val));
+            if (ret < 0 && errno != EINTR) {
+                /* Ignore wake errors and retry */
             }
-            pthread_mutex_unlock(&pool->mutex);
         }
     }
 
     qd_atomic_store(&worker->running, 0);
     return NULL;
+}
+
+static int pool_submit_external(qd_threadpool_t *pool, qd_task_t *task)
+{
+    if (!pool || !task || pool->num_workers <= 0)
+        return QD_ERR_INVAL;
+
+    if (pool->global_ring) {
+        if (qd_mpmc_ring_push(pool->global_ring, task) == QD_OK)
+            return QD_OK;
+    }
+
+    if (pool->ext_rings && pool->num_workers > 0) {
+        unsigned int idx = qd_atomic_fetch_add(&pool->rr_index, 1);
+        qd_mpmc_ring_t *ring = &pool->ext_rings[idx % (unsigned int)pool->num_workers];
+        if (qd_mpmc_ring_push(ring, task) == QD_OK)
+            return QD_OK;
+    }
+
+    if (work_queue_push(&pool->global_queue, task, 0) == 0)
+        return QD_OK;
+
+    return QD_ERR_BUSY;
 }
 
 /*
@@ -498,6 +701,7 @@ qd_threadpool_t *qd_threadpool_create_ex(const qd_threadpool_config_t *config)
     qd_threadpool_t *pool = calloc(1, sizeof(qd_threadpool_t));
     if (!pool)
         return NULL;
+    pool->wake_fd = -1;
 
     /* Initialize configuration */
     pool->num_workers = num_threads;
@@ -510,6 +714,9 @@ qd_threadpool_t *qd_threadpool_create_ex(const qd_threadpool_config_t *config)
     else
         snprintf(pool->name, sizeof(pool->name), "threadpool");
 
+    int global_queue_inited = 0;
+    int ext_rings_inited = 0;
+
     /* Initialize synchronization */
     pthread_mutex_init(&pool->mutex, NULL);
     pthread_cond_init(&pool->cond, NULL);
@@ -517,24 +724,50 @@ qd_threadpool_t *qd_threadpool_create_ex(const qd_threadpool_config_t *config)
 
     /* Allocate workers */
     pool->workers = calloc(num_threads, sizeof(qd_worker_t));
-    if (!pool->workers) {
-        free(pool);
-        return NULL;
-    }
+    if (!pool->workers)
+        goto fail_pool;
 
     /* Allocate per-worker queues */
     pool->queues = calloc(num_threads, sizeof(qd_work_queue_t));
-    if (!pool->queues) {
-        free(pool->workers);
-        free(pool);
-        return NULL;
-    }
+    if (!pool->queues)
+        goto fail_workers;
 
-    /* Initialize global queue */
+    /* Initialize global priority queue */
     work_queue_init(&pool->global_queue);
+    global_queue_inited = 1;
+
+    /* Initialize external rings */
+    size_t ring_capacity = pool->max_queue_size > 0 ? (size_t)pool->max_queue_size : 1024;
+    size_t global_capacity = ring_capacity * (size_t)num_threads;
+    if (global_capacity < ring_capacity)
+        global_capacity = ring_capacity;
+
+    pool->ext_rings = calloc(num_threads, sizeof(*pool->ext_rings));
+    if (!pool->ext_rings)
+        goto fail_queues;
+
+    for (int i = 0; i < num_threads; i++) {
+        if (qd_mpmc_ring_init(&pool->ext_rings[i], ring_capacity) != 0)
+            goto fail_ext_rings;
+    }
+    ext_rings_inited = 1;
+
+    pool->global_ring = qd_calloc(1, sizeof(*pool->global_ring));
+    if (!pool->global_ring)
+        goto fail_ext_rings;
+    if (qd_mpmc_ring_init(pool->global_ring, global_capacity) != 0)
+        goto fail_global_ring;
+
+    /* Initialize eventfd for worker wakeups */
+    pool->wake_fd = eventfd(0, EFD_SEMAPHORE | EFD_CLOEXEC);
+    if (pool->wake_fd < 0)
+        goto fail_global_ring;
+
+    qd_atomic_init(&pool->rr_index, 0);
 
     /* Initialize workers and their queues */
     qd_atomic_store(&pool->running, 1);
+    qd_atomic_store(&pool->paused, 0);
 
     for (int i = 0; i < num_threads; i++) {
         work_queue_init(&pool->queues[i]);
@@ -542,11 +775,11 @@ qd_threadpool_t *qd_threadpool_create_ex(const qd_threadpool_config_t *config)
         pool->workers[i].id = i;
         pool->workers[i].pool = pool;
         pool->workers[i].queue = &pool->queues[i];
+        pool->workers[i].ext_ring = &pool->ext_rings[i];
         qd_atomic_store(&pool->workers[i].running, 1);
         qd_atomic_store(&pool->workers[i].idle, 1);
 
         if (pthread_create(&pool->workers[i].thread, NULL, worker_thread, &pool->workers[i]) != 0) {
-            /* Failed to create thread, cleanup */
             qd_atomic_store(&pool->running, 0);
             for (int j = 0; j < i; j++) {
                 pthread_join(pool->workers[j].thread, NULL);
@@ -554,15 +787,47 @@ qd_threadpool_t *qd_threadpool_create_ex(const qd_threadpool_config_t *config)
             for (int j = 0; j <= i; j++) {
                 work_queue_destroy(&pool->queues[j]);
             }
-            work_queue_destroy(&pool->global_queue);
-            free(pool->queues);
-            free(pool->workers);
-            free(pool);
-            return NULL;
+            goto fail_threads;
         }
     }
 
     return pool;
+
+fail_threads:
+    if (pool->wake_fd >= 0) {
+        close(pool->wake_fd);
+        pool->wake_fd = -1;
+    }
+fail_global_ring:
+    if (pool->global_ring) {
+        qd_mpmc_ring_destroy(pool->global_ring);
+        qd_free(pool->global_ring);
+        pool->global_ring = NULL;
+    }
+fail_ext_rings:
+    if (pool->ext_rings) {
+        if (ext_rings_inited) {
+            for (int i = 0; i < num_threads; i++) {
+                qd_mpmc_ring_destroy(&pool->ext_rings[i]);
+            }
+        }
+        free(pool->ext_rings);
+        pool->ext_rings = NULL;
+    }
+fail_queues:
+    if (global_queue_inited)
+        work_queue_destroy(&pool->global_queue);
+    if (pool->queues)
+        free(pool->queues);
+fail_workers:
+    if (pool->workers)
+        free(pool->workers);
+fail_pool:
+    pthread_cond_destroy(&pool->shutdown_cond);
+    pthread_cond_destroy(&pool->cond);
+    pthread_mutex_destroy(&pool->mutex);
+    free(pool);
+    return NULL;
 }
 
 void qd_threadpool_destroy(qd_threadpool_t *pool)
@@ -583,6 +848,25 @@ void qd_threadpool_destroy(qd_threadpool_t *pool)
         work_queue_destroy(&pool->queues[i]);
     }
     work_queue_destroy(&pool->global_queue);
+
+    if (pool->wake_fd >= 0) {
+        close(pool->wake_fd);
+        pool->wake_fd = -1;
+    }
+
+    if (pool->global_ring) {
+        qd_mpmc_ring_destroy(pool->global_ring);
+        qd_free(pool->global_ring);
+        pool->global_ring = NULL;
+    }
+
+    if (pool->ext_rings) {
+        for (int i = 0; i < pool->num_workers; i++) {
+            qd_mpmc_ring_destroy(&pool->ext_rings[i]);
+        }
+        free(pool->ext_rings);
+        pool->ext_rings = NULL;
+    }
 
     pthread_mutex_destroy(&pool->mutex);
     pthread_cond_destroy(&pool->cond);
@@ -619,34 +903,38 @@ int qd_threadpool_submit_priority(qd_threadpool_t *pool, qd_task_fn_t func,
     task->on_complete = NULL;
     task->next = NULL;
 
-    /* Try to submit to worker queue if we're in a worker thread */
     int worker_id = tls_worker_id;
-    qd_work_queue_t *queue;
+
+    qd_atomic_fetch_add(&pool->pending_tasks, 1);
 
     if (worker_id >= 0 && worker_id < pool->num_workers) {
-        queue = &pool->queues[worker_id];
-    } else {
-        /* Submit to global queue */
-        queue = &pool->global_queue;
-    }
-
-    int result = work_queue_push(queue, task, (worker_id >= 0));
-    if (result != 0) {
-        /* Try global queue as fallback */
-        result = work_queue_push(&pool->global_queue, task, 0);
-        if (result != 0) {
+        qd_work_queue_t *queue = &pool->queues[worker_id];
+        int use_deque = (priority == QD_PRIORITY_NORMAL);
+        if (work_queue_push(queue, task, use_deque) != 0) {
+            qd_atomic_fetch_sub(&pool->pending_tasks, 1);
             qd_task_free(task);
             return QD_ERR_BUSY;
+        }
+    } else {
+        if (priority == QD_PRIORITY_NORMAL) {
+            if (pool_submit_external(pool, task) != QD_OK) {
+                qd_atomic_fetch_sub(&pool->pending_tasks, 1);
+                qd_task_free(task);
+                return QD_ERR_BUSY;
+            }
+        } else {
+            if (work_queue_push(&pool->global_queue, task, 0) != 0) {
+                qd_atomic_fetch_sub(&pool->pending_tasks, 1);
+                qd_task_free(task);
+                return QD_ERR_BUSY;
+            }
         }
     }
 
     qd_atomic_fetch_add(&pool->total_submitted, 1);
-    qd_atomic_fetch_add(&pool->pending_tasks, 1);
 
     /* Wake up a worker */
-    pthread_mutex_lock(&pool->mutex);
-    pthread_cond_signal(&pool->cond);
-    pthread_mutex_unlock(&pool->mutex);
+    qd_pool_wake(pool, 1);
 
     return QD_OK;
 }
@@ -674,18 +962,26 @@ int qd_threadpool_submit_callback(qd_threadpool_t *pool, qd_task_fn_t func,
     task->complete_arg = complete_arg;
     task->next = NULL;
 
-    int result = work_queue_push(&pool->global_queue, task, 0);
-    if (result != 0) {
-        qd_task_free(task);
-        return QD_ERR_BUSY;
+    int worker_id = tls_worker_id;
+    qd_atomic_fetch_add(&pool->pending_tasks, 1);
+    if (worker_id >= 0 && worker_id < pool->num_workers) {
+        qd_work_queue_t *queue = &pool->queues[worker_id];
+        if (work_queue_push(queue, task, 1) != 0) {
+            qd_atomic_fetch_sub(&pool->pending_tasks, 1);
+            qd_task_free(task);
+            return QD_ERR_BUSY;
+        }
+    } else {
+        if (pool_submit_external(pool, task) != QD_OK) {
+            qd_atomic_fetch_sub(&pool->pending_tasks, 1);
+            qd_task_free(task);
+            return QD_ERR_BUSY;
+        }
     }
 
     qd_atomic_fetch_add(&pool->total_submitted, 1);
-    qd_atomic_fetch_add(&pool->pending_tasks, 1);
 
-    pthread_mutex_lock(&pool->mutex);
-    pthread_cond_signal(&pool->cond);
-    pthread_mutex_unlock(&pool->mutex);
+    qd_pool_wake(pool, 1);
 
     return QD_OK;
 }
@@ -719,20 +1015,30 @@ qd_future_t *qd_threadpool_submit_future(qd_threadpool_t *pool, qd_task_fn_t fun
     task->on_complete = NULL;
     task->next = NULL;
 
-    int result = work_queue_push(&pool->global_queue, task, 0);
-    if (result != 0) {
-        qd_task_free(task);
-        qd_future_release(future);  /* Task's reference */
-        qd_future_release(future);  /* Caller's reference */
-        return NULL;
+    int worker_id = tls_worker_id;
+    qd_atomic_fetch_add(&pool->pending_tasks, 1);
+    if (worker_id >= 0 && worker_id < pool->num_workers) {
+        qd_work_queue_t *queue = &pool->queues[worker_id];
+        if (work_queue_push(queue, task, 1) != 0) {
+            qd_atomic_fetch_sub(&pool->pending_tasks, 1);
+            qd_task_free(task);
+            qd_future_release(future);  /* Task's reference */
+            qd_future_release(future);  /* Caller's reference */
+            return NULL;
+        }
+    } else {
+        if (pool_submit_external(pool, task) != QD_OK) {
+            qd_atomic_fetch_sub(&pool->pending_tasks, 1);
+            qd_task_free(task);
+            qd_future_release(future);  /* Task's reference */
+            qd_future_release(future);  /* Caller's reference */
+            return NULL;
+        }
     }
 
     qd_atomic_fetch_add(&pool->total_submitted, 1);
-    qd_atomic_fetch_add(&pool->pending_tasks, 1);
 
-    pthread_mutex_lock(&pool->mutex);
-    pthread_cond_signal(&pool->cond);
-    pthread_mutex_unlock(&pool->mutex);
+    qd_pool_wake(pool, 1);
 
     return future;
 }
@@ -747,6 +1053,7 @@ int qd_threadpool_submit_batch(qd_threadpool_t *pool, qd_task_fn_t *funcs,
         return QD_ERR_BUSY;
 
     int submitted = 0;
+    int worker_id = tls_worker_id;
 
     for (int i = 0; i < count; i++) {
         if (!funcs[i])
@@ -764,9 +1071,22 @@ int qd_threadpool_submit_batch(qd_threadpool_t *pool, qd_task_fn_t *funcs,
         task->on_complete = NULL;
         task->next = NULL;
 
-        if (work_queue_push(&pool->global_queue, task, 0) != 0) {
-            qd_task_free(task);
-            break;
+        qd_atomic_fetch_add(&pool->pending_tasks, 1);
+        if (worker_id >= 0 && worker_id < pool->num_workers) {
+            qd_work_queue_t *queue = &pool->queues[worker_id];
+            if (work_queue_push(queue, task, 1) != 0) {
+                if (pool_submit_external(pool, task) != QD_OK) {
+                    qd_atomic_fetch_sub(&pool->pending_tasks, 1);
+                    qd_task_free(task);
+                    break;
+                }
+            }
+        } else {
+            if (pool_submit_external(pool, task) != QD_OK) {
+                qd_atomic_fetch_sub(&pool->pending_tasks, 1);
+                qd_task_free(task);
+                break;
+            }
         }
 
         submitted++;
@@ -774,12 +1094,8 @@ int qd_threadpool_submit_batch(qd_threadpool_t *pool, qd_task_fn_t *funcs,
 
     if (submitted > 0) {
         qd_atomic_fetch_add(&pool->total_submitted, submitted);
-        qd_atomic_fetch_add(&pool->pending_tasks, submitted);
-
         /* Wake up workers */
-        pthread_mutex_lock(&pool->mutex);
-        pthread_cond_broadcast(&pool->cond);
-        pthread_mutex_unlock(&pool->mutex);
+        qd_pool_wake(pool, (uint64_t)submitted);
     }
 
     return submitted;
@@ -794,9 +1110,7 @@ void qd_threadpool_shutdown(qd_threadpool_t *pool, qd_shutdown_mode_t mode)
     qd_atomic_store(&pool->running, 0);
 
     /* Wake up all workers */
-    pthread_mutex_lock(&pool->mutex);
-    pthread_cond_broadcast(&pool->cond);
-    pthread_mutex_unlock(&pool->mutex);
+    qd_pool_wake(pool, (uint64_t)pool->num_workers);
 }
 
 int qd_threadpool_wait(qd_threadpool_t *pool, int timeout_ms)
@@ -822,18 +1136,16 @@ void qd_threadpool_pause(qd_threadpool_t *pool)
 {
     if (!pool)
         return;
-    qd_atomic_store(&pool->running, 0);
+    qd_atomic_store(&pool->paused, 1);
+    qd_pool_wake(pool, (uint64_t)pool->num_workers);
 }
 
 void qd_threadpool_resume(qd_threadpool_t *pool)
 {
     if (!pool)
         return;
-    qd_atomic_store(&pool->running, 1);
-
-    pthread_mutex_lock(&pool->mutex);
-    pthread_cond_broadcast(&pool->cond);
-    pthread_mutex_unlock(&pool->mutex);
+    qd_atomic_store(&pool->paused, 0);
+    qd_pool_wake(pool, (uint64_t)pool->num_workers);
 }
 
 void qd_threadpool_stats(qd_threadpool_t *pool, qd_threadpool_stats_t *stats)

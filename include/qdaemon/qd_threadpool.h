@@ -20,6 +20,7 @@ typedef struct qd_task qd_task_t;
 typedef struct qd_work_queue qd_work_queue_t;
 typedef struct qd_threadpool qd_threadpool_t;
 typedef struct qd_future qd_future_t;
+typedef struct qd_mpmc_ring qd_mpmc_ring_t;
 
 /* Task function type */
 typedef void (*qd_task_fn_t)(void *arg);
@@ -68,7 +69,7 @@ struct qd_work_queue {
     qd_task_t *priority_tails[QD_PRIORITY_COUNT];
     pthread_mutex_t lock;        /* Lock for priority queues */
     _Atomic int count;           /* Total task count */
-} QD_CACHE_ALIGNED;
+};
 
 /* Thread pool configuration */
 typedef struct qd_threadpool_config {
@@ -94,11 +95,12 @@ typedef struct qd_worker {
     int id;
     qd_threadpool_t *pool;
     qd_work_queue_t *queue;      /* Local work queue */
+    qd_mpmc_ring_t *ext_ring;    /* External submission ring */
     _Atomic int running;
     _Atomic int idle;
     uint64_t tasks_executed;
     uint64_t tasks_stolen;
-} QD_CACHE_ALIGNED qd_worker_t;
+} qd_worker_t;
 
 /* Thread pool structure */
 struct qd_threadpool {
@@ -106,9 +108,15 @@ struct qd_threadpool {
     int num_workers;
     qd_work_queue_t *queues;     /* Per-worker queues */
     qd_work_queue_t global_queue; /* Global overflow queue */
+    qd_mpmc_ring_t *global_ring;  /* Global lock-free ring */
+    qd_mpmc_ring_t *ext_rings;    /* Per-worker external rings */
+    _Atomic unsigned int rr_index; /* Round-robin index */
+
+    int wake_fd;                 /* eventfd for worker wakeups */
 
     _Atomic int running;         /* Pool running state */
     _Atomic int shutdown_mode;   /* 0=none, 1=graceful, 2=immediate */
+    _Atomic int paused;          /* Pause task execution */
     _Atomic int active_workers;  /* Currently working threads */
     _Atomic int pending_tasks;   /* Total pending tasks */
 

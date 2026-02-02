@@ -19,6 +19,8 @@
 } while(0)
 
 static atomic_int counter;
+static atomic_int block_flag;
+static atomic_int started_count;
 
 /* Simple work function */
 static void increment_counter(void *arg)
@@ -32,6 +34,16 @@ static void delayed_work(void *arg)
 {
     int ms = (int)(intptr_t)arg;
     usleep(ms * 1000);
+    atomic_fetch_add(&counter, 1);
+}
+
+static void blocking_work(void *arg)
+{
+    (void)arg;
+    atomic_fetch_add(&started_count, 1);
+    while (atomic_load(&block_flag)) {
+        usleep(1000);
+    }
     atomic_fetch_add(&counter, 1);
 }
 
@@ -50,6 +62,7 @@ TEST(simple_work)
     
     qd_threadpool_t *pool = qd_threadpool_create(2);
     assert(pool != NULL);
+
     
     for (int i = 0; i < 10; i++) {
         int ret = qd_threadpool_submit(pool, increment_counter, NULL);
@@ -60,10 +73,13 @@ TEST(simple_work)
     }
     
     qd_threadpool_shutdown(pool, QD_SHUTDOWN_GRACEFUL);
-    qd_threadpool_wait(pool, 5000);
+    int ret = qd_threadpool_wait(pool, 5000);
+    int val = atomic_load(&counter);
+    if (ret != QD_OK || val != 10) {
+        fprintf(stderr, "threadpool wait=%d counter=%d\n", ret, val);
+        exit(1);
+    }
     qd_threadpool_destroy(pool);
-    
-    assert(atomic_load(&counter) == 10);
 }
 
 /* Test concurrent execution */
@@ -167,6 +183,33 @@ TEST(priority_work)
     assert(atomic_load(&counter) == 3);
 }
 
+TEST(shutdown_inflight_timeout)
+{
+    atomic_store(&counter, 0);
+    atomic_store(&block_flag, 1);
+    atomic_store(&started_count, 0);
+
+    qd_threadpool_t *pool = qd_threadpool_create(1);
+    assert(pool != NULL);
+
+    qd_threadpool_submit(pool, blocking_work, NULL);
+    qd_threadpool_submit(pool, blocking_work, NULL);
+
+    for (int i = 0; i < 50 && atomic_load(&started_count) == 0; i++) {
+        usleep(1000);
+    }
+
+    qd_threadpool_shutdown(pool, QD_SHUTDOWN_IMMEDIATE);
+    int ret = qd_threadpool_wait(pool, 10);
+    if (ret != QD_ERR_TIMEOUT) {
+        fprintf(stderr, "Expected timeout, got %d\n", ret);
+        exit(1);
+    }
+
+    atomic_store(&block_flag, 0);
+    qd_threadpool_destroy(pool);
+}
+
 int main(void)
 {
     printf("\n=== Thread Pool Tests ===\n\n");
@@ -178,6 +221,7 @@ int main(void)
     RUN_TEST(pool_stats);
     RUN_TEST(immediate_shutdown);
     RUN_TEST(priority_work);
+    RUN_TEST(shutdown_inflight_timeout);
     
     printf("\nAll thread pool tests passed!\n\n");
     return 0;

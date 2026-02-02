@@ -27,7 +27,8 @@ endif
 
 DEBUG ?= 0
 ifeq ($(DEBUG), 1)
-    CFLAGS += -g -O0 -DDEBUG
+    CFLAGS += -g -O0 -DDEBUG -fsanitize=address -fno-omit-frame-pointer
+    LDFLAGS += -fsanitize=address
 else
     CFLAGS += -O2 -DNDEBUG
 endif
@@ -72,14 +73,17 @@ EXAMPLES = $(BUILDDIR)/simple_daemon $(BUILDDIR)/multi_instance $(BUILDDIR)/kern
            $(BUILDDIR)/meta_cli $(BUILDDIR)/meta_server $(BUILDDIR)/meta_client \
            $(BUILDDIR)/qd_dhcpd $(BUILDDIR)/qd_dhcp_cli
 TESTS = $(BUILDDIR)/test_memory $(BUILDDIR)/test_threadpool $(BUILDDIR)/test_event $(BUILDDIR)/test_ipc $(BUILDDIR)/test_aio $(BUILDDIR)/test_channel $(BUILDDIR)/test_channel_watch $(BUILDDIR)/test_workqueue
+BENCHES = $(BUILDDIR)/bench_event $(BUILDDIR)/bench_aio $(BUILDDIR)/bench_workqueue
 
-.PHONY: all clean examples tests install kmod kmods
+.PHONY: all clean examples tests benches install kmod kmods
 
 all: $(LIB_STATIC) $(LIB_SHARED) $(CLIENT_STATIC) $(CLIENT_SHARED) examples tests kmods
 
 examples: $(EXAMPLES)
 
 tests: $(TESTS)
+
+benches: $(BENCHES)
 
 # Create directories
 $(BUILDDIR)/core $(BUILDDIR)/core/backend $(BUILDDIR)/ipc $(BUILDDIR)/daemon $(BUILDDIR)/cli $(BUILDDIR)/cint $(BUILDDIR)/client/src:
@@ -176,6 +180,9 @@ $(BUILDDIR)/bench_event: $(TESTDIR)/bench_event.c $(LIB_STATIC)
 	$(CC) $(CFLAGS) $< -o $@ -L$(BUILDDIR) -lqdaemon $(LDFLAGS)
 
 $(BUILDDIR)/bench_aio: $(TESTDIR)/bench_aio.c $(LIB_STATIC)
+	$(CC) $(CFLAGS) $< -o $@ -L$(BUILDDIR) -lqdaemon $(LDFLAGS)
+
+$(BUILDDIR)/bench_workqueue: $(TESTDIR)/bench_workqueue.c $(LIB_STATIC)
 	$(CC) $(CFLAGS) $< -o $@ -L$(BUILDDIR) -lqdaemon $(LDFLAGS)
 
 # Run tests

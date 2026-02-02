@@ -1,6 +1,6 @@
 /*
  * QDaemon - Work Queue Implementation
- * Libuv-style pattern for offloading work to background threads
+ * High-performance libuv-style pattern with slab pooling
  */
 
 #ifndef _GNU_SOURCE
@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <errno.h>
+#include <unistd.h>
 #include <pthread.h>
 #include <stdatomic.h>
 
@@ -20,24 +21,37 @@
 #include "qdaemon/qd_memory.h"
 #include "qdaemon/qd_log.h"
 
-/* Work wrapper for threadpool compatibility */
-typedef struct work_wrapper {
+/*
+ * Combined work item - single allocation for everything
+ * This replaces the old work_wrapper_t + qd_work_t pair
+ */
+typedef struct qd_work_item {
+    /* Work function and args */
     qd_work_fn_t work_fn;
     void *work_arg;
-    qd_work_t *orig_work;  /* Original work struct for callback */
+
+    /* Result and status */
+    void *result;
+    _Atomic int status;
+
+    /* Ownership */
     qd_workqueue_t *wq;
-} work_wrapper_t;
+    void *user_data;
+
+    /* For delayed work */
+    uint64_t delay_ms;
+} qd_work_item_t;
 
 /* Work handle for cancellation */
 struct qd_work_handle {
-    qd_work_t *work;
+    qd_work_item_t *item;
     _Atomic int cancelled;
     qd_workqueue_t *wq;
 };
 
-/* Channel result type (work + status) */
+/* Channel result type - just a pointer now */
 typedef struct result_struct {
-    qd_work_t *work;
+    qd_work_item_t *item;
     int status;
 } result_struct_t;
 
@@ -45,86 +59,141 @@ typedef struct result_struct {
 struct qd_workqueue {
     qd_aio_loop_t *loop;
     qd_threadpool_t *pool;
-    qd_channel_t *channel;        /* Completion channel */
+    qd_channel_t *channel;
     qd_after_work_fn_t on_complete;
     void *complete_arg;
     _Atomic int pending;
-    _Atomic int draining;  /* Are we draining for destruction? */
+    _Atomic int inflight;
+    _Atomic int draining;
+
+    /* Slab cache for work items */
+    qd_slab_cache_t *item_cache;
 };
 
-/* Thread pool wrapper - runs on worker thread */
-static void work_wrapper_fn(void *arg)
+/* Global slab cache for work items (shared across workqueues for efficiency) */
+static qd_slab_cache_t *g_work_item_cache = NULL;
+static pthread_once_t g_cache_init_once = PTHREAD_ONCE_INIT;
+
+static void init_global_cache(void)
 {
-    work_wrapper_t *wrapper = arg;
-    qd_work_t *work = wrapper->orig_work;
+    g_work_item_cache = qd_slab_cache_create("qd_work_item",
+                                             sizeof(qd_work_item_t),
+                                             0,
+                                             QD_SLAB_ZERO);
+}
+
+static inline qd_work_item_t *work_item_alloc(qd_workqueue_t *wq)
+{
+    (void)wq;
+    pthread_once(&g_cache_init_once, init_global_cache);
+    if (g_work_item_cache) {
+        return qd_slab_alloc(g_work_item_cache);
+    }
+    return qd_calloc(1, sizeof(qd_work_item_t));
+}
+
+static inline void work_item_free(qd_workqueue_t *wq, qd_work_item_t *item)
+{
+    (void)wq;
+    if (g_work_item_cache) {
+        qd_slab_free(g_work_item_cache, item);
+    } else {
+        qd_free(item);
+    }
+}
+
+/* Thread pool wrapper - runs on worker thread */
+static void work_item_execute(void *arg)
+{
+    qd_work_item_t *item = arg;
+
+    /* Validate item */
+    if (!item || !item->work_fn || !item->wq) {
+        qd_log_error("Invalid work item: item=%p, work_fn=%p, wq=%p",
+                     (void*)item, item ? (void*)item->work_fn : NULL,
+                     item ? (void*)item->wq : NULL);
+        return;
+    }
 
     /* Check if cancelled */
-    if (atomic_load(&work->status) == QD_WORK_CANCELLED) {
+    if (atomic_load_explicit(&item->status, memory_order_relaxed) == QD_WORK_CANCELLED) {
         return;
     }
 
     /* Run actual work function */
     errno = 0;
-    work->result = wrapper->work_fn(wrapper->work_arg);
+    item->result = item->work_fn(item->work_arg);
 
-    if (work->result == NULL && errno != 0) {
-        work->status = QD_WORK_ERROR;
+    if (item->result == NULL && errno != 0) {
+        atomic_store(&item->status, QD_WORK_ERROR);
     } else {
-        work->status = QD_WORK_OK;
+        atomic_store(&item->status, QD_WORK_OK);
     }
 }
 
 /* Completion callback on worker thread */
-static void work_complete_callback(void *arg, int status)
+static void work_item_complete(void *arg, int status)
 {
     (void)status;
-    work_wrapper_t *wrapper = arg;
-    qd_work_t *work = wrapper->orig_work;
+    qd_work_item_t *item = arg;
+    qd_workqueue_t *wq = item->wq;
 
     /* Don't send to channel if we're draining */
-    if (atomic_load(&wrapper->wq->draining)) {
-        qd_free(wrapper);
+    if (atomic_load_explicit(&wq->draining, memory_order_relaxed)) {
+        atomic_fetch_sub(&wq->inflight, 1);
+        work_item_free(wq, item);
         return;
     }
 
-    /* Push completion to channel - send work pointer and status */
+    /* Push completion to channel */
     result_struct_t result = {
-        .work = work,
-        .status = work->status
+        .item = item,
+        .status = atomic_load(&item->status)
     };
 
-    qd_channel_send(wrapper->wq->channel, &result);
-
-    /* Free wrapper, but not original work (freed in channel drain) */
-    qd_free(wrapper);
+    qd_channel_try_send(wq->channel, &result);
+    atomic_fetch_sub(&wq->inflight, 1);
 }
 
 /* Drain channel and call completions (called from event loop context) */
 static void drain_channel_completions(qd_workqueue_t *wq)
 {
-    result_struct_t result;
+    enum { QD_WQ_BATCH = 128 };
+    result_struct_t results[QD_WQ_BATCH];
 
-    while (qd_channel_try_recv(wq->channel, &result) == QD_OK) {
-        qd_work_t *work = result.work;
-
-        if (work->delay_ms > 0) {
-            /* Delayed work - freed in delayed_trampoline */
+    for (;;) {
+        int count = qd_channel_try_recv_batch(wq->channel, results, QD_WQ_BATCH);
+        if (count <= 0) {
+            qd_channel_ack(wq->channel);
+            if (qd_channel_size(wq->channel) == 0) {
+                break;
+            }
             continue;
         }
 
-        /* Check if cancelled before calling callback */
-        if (atomic_load(&work->status) == QD_WORK_CANCELLED) {
-            qd_free(work);
-        } else if (wq->on_complete) {
-            wq->on_complete(work->result, result.status, work->user_data);
-            qd_free(work);
+        for (int i = 0; i < count; i++) {
+            result_struct_t *result = &results[i];
+            qd_work_item_t *item = result->item;
+
+            if (item->delay_ms > 0) {
+                /* Delayed work - handled elsewhere */
+                continue;
+            }
+
+            /* Check if cancelled before calling callback */
+            int item_status = atomic_load(&item->status);
+            if (item_status == QD_WORK_CANCELLED) {
+                work_item_free(wq, item);
+            } else if (wq->on_complete) {
+                wq->on_complete(item->result, item_status, item->user_data);
+                work_item_free(wq, item);
+            } else {
+                work_item_free(wq, item);
+            }
+
+            atomic_fetch_sub(&wq->pending, 1);
         }
-
-        atomic_fetch_sub(&wq->pending, 1);
     }
-
-    /* Acknowledge events to clear eventfd */
-    qd_channel_ack(wq->channel);
 }
 
 void qd_workqueue_process(qd_workqueue_t *wq)
@@ -134,39 +203,31 @@ void qd_workqueue_process(qd_workqueue_t *wq)
     }
 }
 
-/* Delayed work wrapper for timer completion */
-__attribute__((used)) static void delayed_trampoline(qd_completion_t *comp, void *arg)
+void qd_workqueue_handle_completion(qd_completion_t *comp)
 {
-    (void)comp;
-    qd_work_t *work = arg;
-    qd_workqueue_t *wq = work->wq;
+    if (!comp)
+        return;
 
-    /* Check if cancelled */
-    if (atomic_load(&work->status) == QD_WORK_CANCELLED) {
-        qd_free(work);
+    if (comp->op == QD_OP_CHANNEL) {
+        qd_workqueue_t *wq = (qd_workqueue_t *)comp->user_data;
+        qd_workqueue_process(wq);
         return;
     }
 
-    /* Don't submit if we're draining */
-    if (atomic_load(&wq->draining)) {
-        qd_free(work);
-        return;
+    if (comp->op == QD_OP_TIMEOUT) {
+        qd_work_item_t *item = (qd_work_item_t *)comp->user_data;
+        if (!item || !item->wq)
+            return;
+
+        qd_workqueue_t *wq = item->wq;
+        int ret = qd_threadpool_submit_callback(wq->pool, work_item_execute, item,
+                                                 work_item_complete, item);
+        if (ret != QD_OK) {
+            atomic_fetch_sub(&wq->pending, 1);
+            atomic_fetch_sub(&wq->inflight, 1);
+            work_item_free(wq, item);
+        }
     }
-
-    /* Submit to thread pool immediately */
-    work_wrapper_t *wrapper = qd_calloc(1, sizeof(*wrapper));
-    if (!wrapper) {
-        qd_free(work);
-        return;
-    }
-
-    wrapper->work_fn = (qd_work_fn_t)(uintptr_t)work->work;
-    wrapper->work_arg = work->arg;
-    wrapper->orig_work = work;
-    wrapper->wq = wq;
-
-    qd_threadpool_submit_callback(wq->pool, work_wrapper_fn, wrapper,
-                                         work_complete_callback, wrapper);
 }
 
 qd_workqueue_t *qd_workqueue_create(qd_aio_loop_t *loop,
@@ -189,13 +250,17 @@ qd_workqueue_t *qd_workqueue_create(qd_aio_loop_t *loop,
     wq->complete_arg = complete_arg;
 
     atomic_init(&wq->pending, 0);
+    atomic_init(&wq->inflight, 0);
     atomic_init(&wq->draining, 0);
 
-    /* Create channel for completions (holds result_struct_t) */
+    /* Initialize global slab cache */
+    pthread_once(&g_cache_init_once, init_global_cache);
+
+    /* Create channel for completions */
     qd_channel_config_t chan_config = {
-        .capacity = 1024,
+        .capacity = 4096,
         .item_size = sizeof(result_struct_t),
-        .flags = QD_CHAN_NONBLOCK
+        .flags = 0
     };
     wq->channel = qd_channel_create(&chan_config);
     if (!wq->channel) {
@@ -211,7 +276,7 @@ qd_workqueue_t *qd_workqueue_create(qd_aio_loop_t *loop,
         return NULL;
     }
 
-    qd_log_debug("Created workqueue: loop=%p, pool=%p", loop, pool);
+    qd_log_debug("Created workqueue: loop=%p, pool=%p", (void*)loop, (void*)pool);
 
     return wq;
 }
@@ -222,13 +287,14 @@ void qd_workqueue_destroy(qd_workqueue_t *wq)
         return;
     }
 
-    /* Stop watching channel */
     qd_aio_channel_unwatch(wq->loop, wq->channel);
-
-    /* Set draining flag to stop new completions */
     atomic_store(&wq->draining, 1);
 
-    /* Drain any pending completions */
+    /* Wait for inflight tasks */
+    while (atomic_load(&wq->inflight) > 0) {
+        usleep(1000);
+    }
+
     drain_channel_completions(wq);
 
     qd_channel_destroy(wq->channel);
@@ -241,36 +307,82 @@ int qd_workqueue_submit(qd_workqueue_t *wq, qd_work_fn_t work, void *arg)
         return QD_ERR_INVAL;
     }
 
-    qd_work_t *item = qd_calloc(1, sizeof(*item));
+    qd_work_item_t *item = work_item_alloc(wq);
     if (!item) {
         return QD_ERR_NOMEM;
     }
 
-    /* Store work function in result pointer (hacky but works for our use case) */
-    item->work = (qd_work_fn_t)(uintptr_t)work;
-    item->arg = arg;
+    item->work_fn = work;
+    item->work_arg = arg;
     item->result = NULL;
-    item->status = QD_WORK_OK;
+    atomic_init(&item->status, QD_WORK_OK);
     item->delay_ms = 0;
     item->user_data = wq->complete_arg;
     item->wq = wq;
 
     atomic_fetch_add(&wq->pending, 1);
+    atomic_fetch_add(&wq->inflight, 1);
 
-    /* Create wrapper for threadpool submission */
-    work_wrapper_t *wrapper = qd_calloc(1, sizeof(*wrapper));
-    if (!wrapper) {
-        qd_free(item);
-        return QD_ERR_NOMEM;
+    int ret = qd_threadpool_submit_callback(wq->pool, work_item_execute, item,
+                                             work_item_complete, item);
+    if (ret != QD_OK) {
+        atomic_fetch_sub(&wq->pending, 1);
+        atomic_fetch_sub(&wq->inflight, 1);
+        work_item_free(wq, item);
     }
 
-    wrapper->work_fn = (qd_work_fn_t)(uintptr_t)item->work;
-    wrapper->work_arg = item->arg;
-    wrapper->orig_work = item;
-    wrapper->wq = wq;
+    return ret;
+}
 
-    return qd_threadpool_submit_callback(wq->pool, work_wrapper_fn, wrapper,
-                                         work_complete_callback, wrapper);
+int qd_workqueue_submit_batch(qd_workqueue_t *wq,
+                               qd_work_fn_t *funcs,
+                               void **args,
+                               int count)
+{
+    if (!wq || !funcs || count <= 0) {
+        return QD_ERR_INVAL;
+    }
+
+    int submitted = 0;
+
+    /* Pre-allocate all items */
+    qd_work_item_t **items = alloca(count * sizeof(qd_work_item_t *));
+    for (int i = 0; i < count; i++) {
+        items[i] = work_item_alloc(wq);
+        if (!items[i]) {
+            /* Free already allocated */
+            for (int j = 0; j < i; j++) {
+                work_item_free(wq, items[j]);
+            }
+            return QD_ERR_NOMEM;
+        }
+
+        items[i]->work_fn = funcs[i];
+        items[i]->work_arg = args ? args[i] : NULL;
+        items[i]->result = NULL;
+        atomic_init(&items[i]->status, QD_WORK_OK);
+        items[i]->delay_ms = 0;
+        items[i]->user_data = wq->complete_arg;
+        items[i]->wq = wq;
+    }
+
+    /* Submit all to threadpool */
+    atomic_fetch_add(&wq->pending, count);
+    atomic_fetch_add(&wq->inflight, count);
+
+    for (int i = 0; i < count; i++) {
+        int ret = qd_threadpool_submit_callback(wq->pool, work_item_execute, items[i],
+                                                 work_item_complete, items[i]);
+        if (ret == QD_OK) {
+            submitted++;
+        } else {
+            atomic_fetch_sub(&wq->pending, 1);
+            atomic_fetch_sub(&wq->inflight, 1);
+            work_item_free(wq, items[i]);
+        }
+    }
+
+    return submitted;
 }
 
 int qd_workqueue_submit_delayed(qd_workqueue_t *wq, qd_work_fn_t work,
@@ -280,61 +392,78 @@ int qd_workqueue_submit_delayed(qd_workqueue_t *wq, qd_work_fn_t work,
         return QD_ERR_INVAL;
     }
 
-    qd_work_t *item = qd_calloc(1, sizeof(*item));
+    qd_work_item_t *item = work_item_alloc(wq);
     if (!item) {
         return QD_ERR_NOMEM;
     }
 
-    item->work = work;
-    item->arg = arg;
+    item->work_fn = work;
+    item->work_arg = arg;
     item->result = NULL;
-    item->status = QD_WORK_OK;
+    atomic_init(&item->status, QD_WORK_OK);
     item->delay_ms = delay_ms;
     item->user_data = wq->complete_arg;
     item->wq = wq;
 
     atomic_fetch_add(&wq->pending, 1);
+    atomic_fetch_add(&wq->inflight, 1);
 
-    /* Submit delayed work via AIO timeout */
-    return qd_aio_timeout(wq->loop, (int)delay_ms, item);
+    int ret = qd_aio_timeout(wq->loop, (int)delay_ms, item);
+    if (ret != QD_OK) {
+        atomic_fetch_sub(&wq->pending, 1);
+        atomic_fetch_sub(&wq->inflight, 1);
+        work_item_free(wq, item);
+    }
+    return ret;
 }
 
 int qd_workqueue_submit_work(qd_workqueue_t *wq, qd_work_t *work)
 {
-    if (!work) {
+    if (!wq || !work) {
         return QD_ERR_INVAL;
     }
 
-    work->wq = wq;
-    if (work->user_data == NULL) {
-        work->user_data = wq->complete_arg;
-    }
-
-    atomic_fetch_add(&wq->pending, 1);
-
-    if (work->delay_ms > 0) {
-        /* Delayed submission via timeout */
-        return qd_aio_timeout(wq->loop, (int)work->delay_ms, work);
-    }
-
-    /* Immediate submission */
-    work_wrapper_t *wrapper = qd_calloc(1, sizeof(*wrapper));
-    if (!wrapper) {
+    /* Convert legacy qd_work_t to internal qd_work_item_t */
+    qd_work_item_t *item = work_item_alloc(wq);
+    if (!item) {
         return QD_ERR_NOMEM;
     }
 
-    wrapper->work_fn = (qd_work_fn_t)(uintptr_t)work->work;
-    wrapper->work_arg = work->arg;
-    wrapper->orig_work = work;
-    wrapper->wq = wq;
+    item->work_fn = work->work;
+    item->work_arg = work->arg;
+    item->result = NULL;
+    atomic_init(&item->status, QD_WORK_OK);
+    item->delay_ms = work->delay_ms;
+    item->user_data = work->user_data ? work->user_data : wq->complete_arg;
+    item->wq = wq;
 
-    return qd_threadpool_submit_callback(wq->pool, work_wrapper_fn, wrapper,
-                                         work_complete_callback, wrapper);
+    atomic_fetch_add(&wq->pending, 1);
+    atomic_fetch_add(&wq->inflight, 1);
+
+    if (item->delay_ms > 0) {
+        int ret = qd_aio_timeout(wq->loop, (int)item->delay_ms, item);
+        if (ret != QD_OK) {
+            atomic_fetch_sub(&wq->pending, 1);
+            atomic_fetch_sub(&wq->inflight, 1);
+            work_item_free(wq, item);
+        }
+        return ret;
+    }
+
+    int ret = qd_threadpool_submit_callback(wq->pool, work_item_execute, item,
+                                             work_item_complete, item);
+    if (ret != QD_OK) {
+        atomic_fetch_sub(&wq->pending, 1);
+        atomic_fetch_sub(&wq->inflight, 1);
+        work_item_free(wq, item);
+    }
+
+    return ret;
 }
 
 int qd_workqueue_pending(qd_workqueue_t *wq)
 {
-    return atomic_load(&wq->pending);
+    return wq ? atomic_load(&wq->pending) : 0;
 }
 
 /* Cancellation implementation */
@@ -342,66 +471,66 @@ qd_work_handle_t *qd_workqueue_submit_cancellable(qd_workqueue_t *wq,
                                                    qd_work_fn_t work,
                                                    void *arg)
 {
-    qd_work_t *item = qd_calloc(1, sizeof(*item));
+    if (!wq) {
+        return NULL;
+    }
+
+    qd_work_item_t *item = work_item_alloc(wq);
     if (!item) {
         return NULL;
     }
 
     qd_work_handle_t *handle = qd_calloc(1, sizeof(*handle));
     if (!handle) {
-        qd_free(item);
+        work_item_free(wq, item);
         return NULL;
     }
 
-    item->work = (qd_work_fn_t)(uintptr_t)work;
-    item->arg = arg;
+    item->work_fn = work;
+    item->work_arg = arg;
     item->result = NULL;
-    item->status = QD_WORK_OK;
+    atomic_init(&item->status, QD_WORK_OK);
     item->delay_ms = 0;
     item->user_data = wq->complete_arg;
     item->wq = wq;
 
-    handle->work = item;
+    handle->item = item;
     atomic_init(&handle->cancelled, 0);
     handle->wq = wq;
 
     atomic_fetch_add(&wq->pending, 1);
+    atomic_fetch_add(&wq->inflight, 1);
 
-    work_wrapper_t *wrapper = qd_calloc(1, sizeof(*wrapper));
-    if (!wrapper) {
-        qd_free(item);
+    int ret = qd_threadpool_submit_callback(wq->pool, work_item_execute, item,
+                                             work_item_complete, item);
+    if (ret != QD_OK) {
+        atomic_fetch_sub(&wq->pending, 1);
+        atomic_fetch_sub(&wq->inflight, 1);
+        work_item_free(wq, item);
         qd_free(handle);
         return NULL;
     }
-
-    wrapper->work_fn = (qd_work_fn_t)(uintptr_t)item->work;
-    wrapper->work_arg = item->arg;
-    wrapper->orig_work = item;
-    wrapper->wq = wq;
 
     return handle;
 }
 
 int qd_workqueue_cancel(qd_work_handle_t *handle)
 {
-    if (!handle || !handle->work) {
+    if (!handle || !handle->item) {
         return QD_ERR_INVAL;
     }
 
     atomic_store(&handle->cancelled, 1);
-    handle->work->status = QD_WORK_CANCELLED;
+    atomic_store(&handle->item->status, QD_WORK_CANCELLED);
 
     return QD_OK;
 }
 
 void qd_work_handle_release(qd_work_handle_t *handle)
 {
-    if (!handle) {
-        return;
+    if (handle) {
+        qd_free(handle);
     }
-
-    /* Don't free work here - it's freed after completion */
-    qd_free(handle);
 }
 
 qd_channel_t *qd_workqueue_channel(qd_workqueue_t *wq)

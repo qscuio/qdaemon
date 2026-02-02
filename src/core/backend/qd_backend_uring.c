@@ -14,10 +14,22 @@
 #include <unistd.h>
 #include <errno.h>
 #include <string.h>
+#include <poll.h>
+#include <pthread.h>
+#include <stdatomic.h>
 
 #include "qd_backend.h"
 #include "qdaemon/qd_memory.h"
 #include "qdaemon/qd_log.h"
+
+/* Channel watch entry (for qd_aio_channel_watch) */
+typedef struct qd_ur_watch {
+    int fd;
+    void *user_data;
+    _Atomic int active;
+    struct qd_ur_watch *next;
+    struct qd_ur_watch *prev;
+} qd_ur_watch_t;
 
 /* io_uring backend context */
 typedef struct qd_ur_backend {
@@ -25,7 +37,50 @@ typedef struct qd_ur_backend {
     int pending;
     uint32_t features;
     int queue_depth;
+
+    /* Watched fds for channel notifications */
+    qd_ur_watch_t *watch_head;
+    qd_ur_watch_t *watch_tail;
+    pthread_mutex_t watch_lock;
 } qd_ur_backend_t;
+
+static qd_ur_watch_t *qd_ur_find_watch_by_ptr(qd_ur_backend_t *ur, void *ptr)
+{
+    qd_ur_watch_t *w = ur->watch_head;
+    while (w) {
+        if ((void *)w == ptr)
+            return w;
+        w = w->next;
+    }
+    return NULL;
+}
+
+static qd_ur_watch_t *qd_ur_find_watch_by_fd(qd_ur_backend_t *ur, int fd)
+{
+    qd_ur_watch_t *w = ur->watch_head;
+    while (w) {
+        if (w->fd == fd)
+            return w;
+        w = w->next;
+    }
+    return NULL;
+}
+
+static int qd_ur_watch_submit(qd_ur_backend_t *ur, qd_ur_watch_t *watch)
+{
+    struct io_uring_sqe *sqe = io_uring_get_sqe(&ur->ring);
+    if (!sqe)
+        return QD_ERR_BUSY;
+
+    io_uring_prep_poll_add(sqe, watch->fd, POLLIN);
+    io_uring_sqe_set_data(sqe, watch);
+
+    int ret = io_uring_submit(&ur->ring);
+    if (ret < 0)
+        return ret;
+
+    return QD_OK;
+}
 
 static void *qd_ur_init(int queue_depth)
 {
@@ -55,6 +110,8 @@ static void *qd_ur_init(int queue_depth)
         }
     }
 
+    pthread_mutex_init(&ur->watch_lock, NULL);
+
     /* Record supported features */
     ur->features = QD_FEAT_ASYNC_IO;
 
@@ -78,6 +135,16 @@ static void qd_ur_destroy(void *ctx)
     qd_ur_backend_t *ur = ctx;
     if (!ur)
         return;
+
+    pthread_mutex_lock(&ur->watch_lock);
+    qd_ur_watch_t *w = ur->watch_head;
+    while (w) {
+        qd_ur_watch_t *next = w->next;
+        qd_free(w);
+        w = next;
+    }
+    pthread_mutex_unlock(&ur->watch_lock);
+    pthread_mutex_destroy(&ur->watch_lock);
 
     io_uring_queue_exit(&ur->ring);
     qd_free(ur);
@@ -239,6 +306,48 @@ static int qd_ur_submit_batch(void *ctx, qd_aio_req_t *reqs, int count)
     return prepared;
 }
 
+static int qd_ur_handle_cqe(qd_ur_backend_t *ur, struct io_uring_cqe *cqe,
+                            qd_completion_t *out)
+{
+    void *data = io_uring_cqe_get_data(cqe);
+    qd_ur_watch_t *watch = NULL;
+
+    if (ur->watch_head) {
+        pthread_mutex_lock(&ur->watch_lock);
+        watch = qd_ur_find_watch_by_ptr(ur, data);
+        pthread_mutex_unlock(&ur->watch_lock);
+    }
+
+    if (watch) {
+        if (!atomic_load_explicit(&watch->active, memory_order_relaxed)) {
+            return 0; /* Drop inactive watch completions */
+        }
+
+        out->user_data = watch->user_data;
+        out->result = 0;
+        out->flags = 0;
+        out->op = QD_OP_CHANNEL;
+
+        /* Rearm watch for next notification */
+        (void)qd_ur_watch_submit(ur, watch);
+        return 1;
+    }
+
+    out->user_data = data;
+    out->result = cqe->res;
+    out->flags = 0;
+
+    if (cqe->flags & IORING_CQE_F_MORE)
+        out->flags |= QD_CQE_FLAG_MORE;
+
+    out->op = QD_OP_NOP; /* Caller typically tracks this via user_data */
+
+    if (!(out->flags & QD_CQE_FLAG_MORE))
+        ur->pending--;
+
+    return 1;
+}
+
 static int qd_ur_wait(void *ctx, qd_completion_t *out, int max, int timeout_ms)
 {
     qd_ur_backend_t *ur = ctx;
@@ -263,47 +372,20 @@ static int qd_ur_wait(void *ctx, qd_completion_t *out, int max, int timeout_ms)
         return ret;
     }
 
-    /* Process first completion */
-    out[count].user_data = io_uring_cqe_get_data(cqe);
-    out[count].result = cqe->res;
-    out[count].flags = 0;
+    /* Process completions */
+    for (;;) {
+        int produced = qd_ur_handle_cqe(ur, cqe, &out[count]);
+        io_uring_cqe_seen(&ur->ring, cqe);
 
-    /* Check for multishot flag */
-    if (cqe->flags & IORING_CQE_F_MORE)
-        out[count].flags |= QD_CQE_FLAG_MORE;
+        if (produced) {
+            count++;
+            if (count >= max)
+                break;
+        }
 
-    /* Determine operation type from result (heuristic) */
-    out[count].op = QD_OP_NOP; /* Caller typically tracks this via user_data */
-
-    io_uring_cqe_seen(&ur->ring, cqe);
-
-    /* Only decrement pending if not multishot */
-    if (!(out[count].flags & QD_CQE_FLAG_MORE))
-        ur->pending--;
-
-    count++;
-
-    /* Peek for more completions */
-    while (count < max) {
         ret = io_uring_peek_cqe(&ur->ring, &cqe);
         if (ret < 0)
             break;
-
-        out[count].user_data = io_uring_cqe_get_data(cqe);
-        out[count].result = cqe->res;
-        out[count].flags = 0;
-
-        if (cqe->flags & IORING_CQE_F_MORE)
-            out[count].flags |= QD_CQE_FLAG_MORE;
-
-        out[count].op = QD_OP_NOP;
-
-        io_uring_cqe_seen(&ur->ring, cqe);
-
-        if (!(out[count].flags & QD_CQE_FLAG_MORE))
-            ur->pending--;
-
-        count++;
     }
 
     return count;
@@ -313,6 +395,62 @@ static int qd_ur_pending(void *ctx)
 {
     qd_ur_backend_t *ur = ctx;
     return ur->pending;
+}
+
+static int qd_ur_watch_fd(void *ctx, int fd, void *user_data)
+{
+    qd_ur_backend_t *ur = ctx;
+
+    qd_ur_watch_t *watch = qd_calloc(1, sizeof(*watch));
+    if (!watch)
+        return QD_ERR_NOMEM;
+
+    watch->fd = fd;
+    watch->user_data = user_data;
+    atomic_store(&watch->active, 1);
+
+    pthread_mutex_lock(&ur->watch_lock);
+    if (ur->watch_tail)
+        ur->watch_tail->next = watch;
+    else
+        ur->watch_head = watch;
+    watch->prev = ur->watch_tail;
+    ur->watch_tail = watch;
+    pthread_mutex_unlock(&ur->watch_lock);
+
+    int ret = qd_ur_watch_submit(ur, watch);
+    if (ret != QD_OK) {
+        pthread_mutex_lock(&ur->watch_lock);
+        if (watch->prev)
+            watch->prev->next = watch->next;
+        else
+            ur->watch_head = watch->next;
+        if (watch->next)
+            watch->next->prev = watch->prev;
+        else
+            ur->watch_tail = watch->prev;
+        pthread_mutex_unlock(&ur->watch_lock);
+        qd_free(watch);
+        return ret;
+    }
+
+    return QD_OK;
+}
+
+static int qd_ur_unwatch_fd(void *ctx, int fd)
+{
+    qd_ur_backend_t *ur = ctx;
+
+    pthread_mutex_lock(&ur->watch_lock);
+    qd_ur_watch_t *watch = qd_ur_find_watch_by_fd(ur, fd);
+    if (!watch) {
+        pthread_mutex_unlock(&ur->watch_lock);
+        return QD_ERR_NOENT;
+    }
+    atomic_store(&watch->active, 0);
+    pthread_mutex_unlock(&ur->watch_lock);
+
+    return QD_OK;
 }
 
 /* Export backend ops */
@@ -325,6 +463,8 @@ const qd_backend_ops_t qd_backend_uring = {
     .submit_batch = qd_ur_submit_batch,
     .wait         = qd_ur_wait,
     .pending      = qd_ur_pending,
+    .watch_fd     = qd_ur_watch_fd,
+    .unwatch_fd   = qd_ur_unwatch_fd,
 };
 
 #endif /* QD_BACKEND_URING */

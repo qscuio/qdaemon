@@ -10,6 +10,7 @@
 #include <stdint.h>
 #include "qd_common.h"
 #include "qdaemon/qd_channel.h"
+#include "qdaemon/qd_aio_ops.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -54,6 +55,12 @@ void qd_workqueue_destroy(qd_workqueue_t *wq);
 /* Submit work */
 int qd_workqueue_submit(qd_workqueue_t *wq, qd_work_fn_t work, void *arg);
 
+/* Submit batch of work items (more efficient than individual submits) */
+int qd_workqueue_submit_batch(qd_workqueue_t *wq,
+                               qd_work_fn_t *funcs,
+                               void **args,
+                               int count);
+
 /* Submit with delay */
 int qd_workqueue_submit_delayed(qd_workqueue_t *wq, qd_work_fn_t work,
                                  void *arg, uint64_t delay_ms);
@@ -83,6 +90,9 @@ qd_channel_t *qd_workqueue_channel(qd_workqueue_t *wq);
 
 /* Process completions from the workqueue channel (call this when QD_OP_CHANNEL triggers) */
 void qd_workqueue_process(qd_workqueue_t *wq);
+
+/* Handle a completion that may belong to the workqueue (QD_OP_CHANNEL / QD_OP_TIMEOUT) */
+void qd_workqueue_handle_completion(qd_completion_t *comp);
 
 #ifdef __cplusplus
 }

@@ -390,6 +390,10 @@ int qd_aio_channel_watch(qd_aio_loop_t *loop, qd_channel_t *chan,
         return QD_ERR_INVAL;
     }
 
+    if (!loop->backend->watch_fd) {
+        return QD_ERR_NOSYS;
+    }
+
     return loop->backend->watch_fd(loop->backend_ctx,
                                    qd_channel_fd(chan), user_data);
 }
@@ -398,6 +402,10 @@ int qd_aio_channel_unwatch(qd_aio_loop_t *loop, qd_channel_t *chan)
 {
     if (!loop || !chan) {
         return QD_ERR_INVAL;
+    }
+
+    if (!loop->backend->unwatch_fd) {
+        return QD_ERR_NOSYS;
     }
 
     return loop->backend->unwatch_fd(loop->backend_ctx,

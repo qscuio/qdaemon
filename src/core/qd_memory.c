@@ -10,6 +10,7 @@
 #include <sys/mman.h>
 #include <pthread.h>
 #include <errno.h>
+#include <stdalign.h>
 
 #include "qdaemon/qd_memory.h"
 #include "../util/qd_atomic.h"
@@ -34,6 +35,37 @@ static struct {
     .lock = PTHREAD_MUTEX_INITIALIZER,
 };
 
+#define QD_ALLOC_MAGIC 0x51444D48u /* "QDMH" */
+#define QD_ALLOC_FLAG_SLAB 0x01
+#define QD_ALLOC_FLAG_HEAP 0x02
+#define QD_MAX_ALIGN _Alignof(max_align_t)
+
+typedef struct qd_alloc_header {
+    uint32_t magic;
+    uint16_t flags;
+    uint16_t reserved;
+    size_t size;
+    qd_slab_cache_t *cache;
+    qd_slab_t *slab;
+} qd_alloc_header_t;
+
+static inline size_t qd_alloc_header_size(void)
+{
+    return QD_ALIGN(sizeof(qd_alloc_header_t), QD_MAX_ALIGN);
+}
+
+static inline qd_alloc_header_t *qd_alloc_header_from_user(void *ptr)
+{
+    return (qd_alloc_header_t *)((char *)ptr - qd_alloc_header_size());
+}
+
+static pthread_once_t g_memory_once = PTHREAD_ONCE_INIT;
+
+static void qd_memory_init_once(void)
+{
+    (void)qd_memory_init();
+}
+
 /* Size classes for slab allocator */
 static const size_t size_classes[] = {
     8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384
@@ -48,11 +80,13 @@ static int get_num_cpus(void)
 }
 
 /* Get current CPU (simplified) */
+#if 0
 static int get_current_cpu(void)
 {
     /* Use thread ID as approximation */
     return (int)((uintptr_t)pthread_self() % get_num_cpus());
 }
+#endif
 
 /* Allocate memory pages */
 static void *alloc_pages(size_t size)
@@ -137,14 +171,67 @@ static void slab_list_remove(qd_slab_t **head, qd_slab_t *slab)
     slab->prev = NULL;
 }
 
-/* Get slab from object pointer */
-static qd_slab_t *slab_from_obj(qd_slab_cache_t *cache, void *obj)
+static inline int slab_ptr_matches(qd_slab_cache_t *cache, qd_slab_t *slab, void *ptr)
 {
-    size_t header_size = QD_ALIGN(sizeof(qd_slab_t), 16);
-    /* Slab starts at page boundary minus header */
-    uintptr_t slab_size = cache->slab_size + header_size;
-    uintptr_t addr = (uintptr_t)obj;
-    return (qd_slab_t *)(addr - ((addr - header_size) % slab_size));
+    uintptr_t p = (uintptr_t)ptr;
+    uintptr_t base = (uintptr_t)slab->base;
+    uintptr_t end = base + cache->slab_size;
+    if (p < base || p >= end)
+        return 0;
+    return ((p - base) % cache->obj_size) == 0;
+}
+
+static void slab_free_locked(qd_slab_cache_t *cache, qd_slab_t *slab, void *ptr)
+{
+    /* Poison if requested */
+    if (cache->flags & QD_SLAB_POISON)
+        memset(ptr, 0xDE, cache->obj_size);
+
+    /* Add to freelist */
+    *(void **)ptr = slab->freelist;
+    slab->freelist = ptr;
+    slab->inuse--;
+
+    /* Move slab between lists if needed */
+    if (slab->inuse == 0) {
+        /* Now empty */
+        slab_list_remove(&cache->slabs_partial, slab);
+        slab_list_add(&cache->slabs_empty, slab);
+    } else if (slab->inuse == slab->total - 1) {
+        /* Was full, now partial */
+        slab_list_remove(&cache->slabs_full, slab);
+        slab_list_add(&cache->slabs_partial, slab);
+    }
+
+    cache->frees++;
+}
+
+/* Find slab containing object pointer (lock must be held) */
+static qd_slab_t *slab_find_by_ptr(qd_slab_cache_t *cache, void *ptr)
+{
+    uintptr_t addr = (uintptr_t)ptr;
+    size_t slab_size = cache->slab_size;
+
+    for (qd_slab_t *slab = cache->slabs_full; slab; slab = slab->next) {
+        uintptr_t base = (uintptr_t)slab->base;
+        if (addr >= base && addr < base + slab_size &&
+            slab_ptr_matches(cache, slab, ptr))
+            return slab;
+    }
+    for (qd_slab_t *slab = cache->slabs_partial; slab; slab = slab->next) {
+        uintptr_t base = (uintptr_t)slab->base;
+        if (addr >= base && addr < base + slab_size &&
+            slab_ptr_matches(cache, slab, ptr))
+            return slab;
+    }
+    for (qd_slab_t *slab = cache->slabs_empty; slab; slab = slab->next) {
+        uintptr_t base = (uintptr_t)slab->base;
+        if (addr >= base && addr < base + slab_size &&
+            slab_ptr_matches(cache, slab, ptr))
+            return slab;
+    }
+
+    return NULL;
 }
 
 qd_slab_cache_t *qd_slab_cache_create(const char *name, size_t size, size_t align, uint32_t flags)
@@ -222,13 +309,15 @@ void qd_slab_cache_destroy(qd_slab_cache_t *cache)
     free(cache);
 }
 
-void *qd_slab_alloc(qd_slab_cache_t *cache)
+static void *qd_slab_alloc_internal(qd_slab_cache_t *cache, qd_slab_t **slab_out)
 {
     if (!cache)
         return NULL;
 
     void *obj = NULL;
 
+    /* Per-CPU cache disabled due to thread safety issues with simple hashing */
+#if 0
     /* Try CPU cache first (fast path) */
     if (cache->cpu_caches) {
         int cpu = get_current_cpu();
@@ -240,6 +329,7 @@ void *qd_slab_alloc(qd_slab_cache_t *cache)
             return obj;
         }
     }
+#endif
 
     /* Slow path: allocate from slab */
     pthread_mutex_lock(&cache->lock);
@@ -279,11 +369,19 @@ void *qd_slab_alloc(qd_slab_cache_t *cache)
 
     pthread_mutex_unlock(&cache->lock);
 
+    if (slab_out)
+        *slab_out = slab;
+
     /* Zero if requested */
     if (cache->flags & QD_SLAB_ZERO)
         memset(obj, 0, cache->obj_size);
 
     return obj;
+}
+
+void *qd_slab_alloc(qd_slab_cache_t *cache)
+{
+    return qd_slab_alloc_internal(cache, NULL);
 }
 
 void *qd_slab_zalloc(qd_slab_cache_t *cache)
@@ -294,11 +392,13 @@ void *qd_slab_zalloc(qd_slab_cache_t *cache)
     return obj;
 }
 
-void qd_slab_free(qd_slab_cache_t *cache, void *ptr)
+static int slab_free_checked(qd_slab_cache_t *cache, void *ptr)
 {
     if (!cache || !ptr)
-        return;
+        return 0;
 
+    /* Per-CPU cache disabled due to thread safety issues */
+#if 0
     /* Try to add to CPU cache first (fast path) */
     if (cache->cpu_caches) {
         int cpu = get_current_cpu();
@@ -309,35 +409,25 @@ void qd_slab_free(qd_slab_cache_t *cache, void *ptr)
             return;
         }
     }
+#endif
 
     /* Slow path: return to slab */
     pthread_mutex_lock(&cache->lock);
 
-    qd_slab_t *slab = slab_from_obj(cache, ptr);
-
-    /* Poison if requested */
-    if (cache->flags & QD_SLAB_POISON)
-        memset(ptr, 0xDE, cache->obj_size);
-
-    /* Add to freelist */
-    *(void **)ptr = slab->freelist;
-    slab->freelist = ptr;
-    slab->inuse--;
-
-    /* Move slab between lists if needed */
-    if (slab->inuse == 0) {
-        /* Now empty */
-        slab_list_remove(&cache->slabs_partial, slab);
-        slab_list_add(&cache->slabs_empty, slab);
-    } else if (slab->inuse == slab->total - 1) {
-        /* Was full, now partial */
-        slab_list_remove(&cache->slabs_full, slab);
-        slab_list_add(&cache->slabs_partial, slab);
+    qd_slab_t *slab = slab_find_by_ptr(cache, ptr);
+    if (!slab) {
+        pthread_mutex_unlock(&cache->lock);
+        return 0;
     }
-
-    cache->frees++;
+    slab_free_locked(cache, slab, ptr);
 
     pthread_mutex_unlock(&cache->lock);
+    return 1;
+}
+
+void qd_slab_free(qd_slab_cache_t *cache, void *ptr)
+{
+    (void)slab_free_checked(cache, ptr);
 }
 
 int qd_slab_cache_shrink(qd_slab_cache_t *cache)
@@ -597,6 +687,10 @@ static int find_size_class(size_t size)
 
 int qd_memory_init(void)
 {
+#ifdef QD_MEMORY_DISABLE_SLAB
+    return 0;
+#endif
+
     if (g_memory.initialized)
         return 0;
 
@@ -611,7 +705,7 @@ int qd_memory_init(void)
     for (size_t i = 0; i < NUM_SIZE_CLASSES; i++) {
         char name[32];
         snprintf(name, sizeof(name), "size-%zu", size_classes[i]);
-        g_memory.caches[i] = qd_slab_cache_create(name, size_classes[i], 0, 0);
+        g_memory.caches[i] = qd_slab_cache_create(name, size_classes[i], QD_MAX_ALIGN, 0);
         if (!g_memory.caches[i]) {
             /* Cleanup and fail */
             for (size_t j = 0; j < i; j++) {
@@ -652,26 +746,52 @@ void *qd_malloc(size_t size)
     if (size == 0)
         return NULL;
 
+#ifndef QD_MEMORY_DISABLE_SLAB
+    pthread_once(&g_memory_once, qd_memory_init_once);
+#endif
+
+    size_t header_size = qd_alloc_header_size();
+    if (size > SIZE_MAX - header_size)
+        return NULL;
+    size_t alloc_size = size + header_size;
+
     /* Try slab allocator for small sizes */
     if (g_memory.initialized) {
-        int class_idx = find_size_class(size);
+        int class_idx = find_size_class(alloc_size);
         if (class_idx >= 0) {
-            void *ptr = qd_slab_alloc(g_memory.caches[class_idx]);
-            if (ptr) {
+            qd_slab_cache_t *cache = g_memory.caches[class_idx];
+            qd_slab_t *slab = NULL;
+            void *obj = qd_slab_alloc_internal(cache, &slab);
+            if (obj) {
+                qd_alloc_header_t *hdr = (qd_alloc_header_t *)obj;
+                hdr->magic = QD_ALLOC_MAGIC;
+                hdr->flags = QD_ALLOC_FLAG_SLAB;
+                hdr->reserved = 0;
+                hdr->size = size;
+                hdr->cache = cache;
+                hdr->slab = slab;
                 qd_atomic_fetch_add(&g_memory.slab_allocations, 1);
                 qd_atomic_fetch_add(&g_memory.total_allocated, size);
-                return ptr;
+                return (char *)obj + header_size;
             }
         }
     }
 
     /* Fall back to malloc for large allocations */
-    void *ptr = malloc(size);
-    if (ptr) {
+    void *base = malloc(alloc_size);
+    if (base) {
+        qd_alloc_header_t *hdr = (qd_alloc_header_t *)base;
+        hdr->magic = QD_ALLOC_MAGIC;
+        hdr->flags = QD_ALLOC_FLAG_HEAP;
+        hdr->reserved = 0;
+        hdr->size = size;
+        hdr->cache = NULL;
+        hdr->slab = NULL;
         qd_atomic_fetch_add(&g_memory.heap_allocations, 1);
         qd_atomic_fetch_add(&g_memory.total_allocated, size);
+        return (char *)base + header_size;
     }
-    return ptr;
+    return NULL;
 }
 
 void *qd_calloc(size_t nmemb, size_t size)
@@ -693,13 +813,17 @@ void *qd_realloc(void *ptr, size_t size)
         return NULL;
     }
 
-    /* Simple implementation: allocate new, copy, free old */
+    /* Allocate new, copy, free old */
     void *new_ptr = qd_malloc(size);
-    if (new_ptr) {
-        /* We don't know the old size, so this is a limitation */
-        memcpy(new_ptr, ptr, size);
-        qd_free(ptr);
-    }
+    if (!new_ptr)
+        return NULL;
+
+    size_t header_size = qd_alloc_header_size();
+    qd_alloc_header_t *hdr = (qd_alloc_header_t *)((char *)ptr - header_size);
+    size_t old_size = hdr->size;
+    size_t copy_size = old_size < size ? old_size : size;
+    memcpy(new_ptr, ptr, copy_size);
+    qd_free(ptr);
     return new_ptr;
 }
 
@@ -708,19 +832,24 @@ void qd_free(void *ptr)
     if (!ptr)
         return;
 
-    /* Check if this is from a slab cache */
-    if (g_memory.initialized) {
-        for (int i = 0; i < g_memory.num_caches; i++) {
-            /* This is a simplified check - in production you'd want better tracking */
-            qd_slab_cache_t *cache = g_memory.caches[i];
-            /* Try to free to this cache if size matches */
-            qd_slab_free(cache, ptr);
+    size_t header_size = qd_alloc_header_size();
+    qd_alloc_header_t *hdr = (qd_alloc_header_t *)((char *)ptr - header_size);
+
+    if (hdr->flags & QD_ALLOC_FLAG_SLAB) {
+        qd_slab_cache_t *cache = hdr->cache;
+        qd_slab_t *slab = hdr->slab;
+        if (cache && slab) {
+            pthread_mutex_lock(&cache->lock);
+            if (slab_ptr_matches(cache, slab, hdr)) {
+                slab_free_locked(cache, slab, hdr);
+            }
+            pthread_mutex_unlock(&cache->lock);
+            qd_atomic_fetch_add(&g_memory.total_freed, 1);
             return;
         }
     }
 
-    /* Fall back to free */
-    free(ptr);
+    free(hdr);
     qd_atomic_fetch_add(&g_memory.total_freed, 1);
 }
 
