@@ -26,6 +26,7 @@ typedef enum qd_op_type {
     QD_OP_CLOSE,         /* Close fd */
     QD_OP_TIMEOUT,       /* Timeout event */
     QD_OP_CANCEL,        /* Cancel operation */
+    QD_OP_CHANNEL,       /* Channel readable (for workqueue completion) */
     QD_OP_MAX
 } qd_op_type_t;
 
@@ -63,17 +64,18 @@ typedef struct qd_completion {
 static inline const char *qd_op_type_name(qd_op_type_t op)
 {
     static const char *names[] = {
-        [QD_OP_NOP]     = "nop",
-        [QD_OP_READ]    = "read",
-        [QD_OP_WRITE]   = "write",
-        [QD_OP_POLL]    = "poll",
-        [QD_OP_ACCEPT]  = "accept",
-        [QD_OP_CONNECT] = "connect",
-        [QD_OP_SEND]    = "send",
-        [QD_OP_RECV]    = "recv",
-        [QD_OP_CLOSE]   = "close",
-        [QD_OP_TIMEOUT] = "timeout",
-        [QD_OP_CANCEL]  = "cancel",
+        [QD_OP_NOP]      = "nop",
+        [QD_OP_READ]     = "read",
+        [QD_OP_WRITE]    = "write",
+        [QD_OP_POLL]     = "poll",
+        [QD_OP_ACCEPT]   = "accept",
+        [QD_OP_CONNECT]  = "connect",
+        [QD_OP_SEND]     = "send",
+        [QD_OP_RECV]     = "recv",
+        [QD_OP_CLOSE]    = "close",
+        [QD_OP_TIMEOUT]  = "timeout",
+        [QD_OP_CANCEL]   = "cancel",
+        [QD_OP_CHANNEL]  = "channel",
     };
     return (op < QD_OP_MAX) ? names[op] : "unknown";
 }
